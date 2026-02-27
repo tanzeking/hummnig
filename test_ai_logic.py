@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 import re
-import aiohttp
+import urllib.request
 
 async def test_ai():
     # 模拟读取 .env
@@ -66,10 +66,10 @@ async def test_ai():
         "max_tokens": 512
     }
     
+    req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                resp_json = await resp.json()
+        with urllib.request.urlopen(req) as response:
+            resp_json = json.loads(response.read().decode('utf-8'))
     except Exception as e:
         print("请求失败:", e)
         return
