@@ -61,11 +61,14 @@ class BitfinexAPI:
         return await self.request("/auth/w/deriv/collateral/set", {"symbol": symbol, "dir": 1, "leverage": int(leverage)})
 
     async def create_order(self, symbol, order_type, amount, price=None, reduce_only=False):
+        # 强制格式化处理，丢弃负面科学计数法例如 "1e-5"
+        amount_str = "{:.6f}".format(float(amount))
+        
         # Bitfinex 要求 amount 为正表示买，为负表示卖
         req = {
             "type": order_type.upper(),
             "symbol": symbol,
-            "amount": str(amount),
+            "amount": amount_str,
         }
         if price:
             req["price"] = str(price)
