@@ -303,10 +303,29 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 pos = self.current_position
                 pos_info = f"{pos.get('side')} entry:{pos.get('price')} BTC:{pos.get('amount')}"
 
+            # 📊 抓取盘口深度数据 (买卖前5档挂单量，让AI看清多空力量对比)
+            depth_data = {"bids": [], "asks": []}
+            try:
+                connector = self.connectors[self.data_exchange]
+                order_book = connector.get_order_book(self.trading_pair)
+                # 买盘前5档: 价格从高到低 (越高越强的买方支撑)
+                for i, row in enumerate(order_book.bid_entries()):
+                    if i >= 5:
+                        break
+                    depth_data["bids"].append([round(float(row.price), 2), round(float(row.amount), 4)])
+                # 卖盘前5档: 价格从低到高 (越低越近的卖方压力)
+                for i, row in enumerate(order_book.ask_entries()):
+                    if i >= 5:
+                        break
+                    depth_data["asks"].append([round(float(row.price), 2), round(float(row.amount), 4)])
+            except Exception as e:
+                self.logger().warning(f"获取深度数据失败: {e}")
+
             return {
                 "current_price": round(mid_price, 2),
                 "candles_1m_ohlcv": ai_kline_data,
                 "trend_stats": trend_stats,
+                "order_book_depth": depth_data,
                 "current_position": pos_info,
             }
         except Exception as e:
