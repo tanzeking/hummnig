@@ -1,0 +1,10 @@
+FROM hummingbot/hummingbot:latest
+
+# 更新并在官方镜像基础上安装策略必备依赖库
+USER root
+
+RUN apt-get update && apt-get install -y gcc \
+    && pip install --no-cache-dir openai ccxt google-genai python-dotenv pandas
+
+# 恢复默认的使用者
+USER hummingbot
