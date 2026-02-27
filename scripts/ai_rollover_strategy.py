@@ -194,20 +194,14 @@ class AiRolloverStrategy(ScriptStrategyBase):
             if "</think>" in result_text:
                 result_text = result_text.split("</think>")[1]
             
-            # 兼容老版本 Python 3.6 的基础正则 JSON 提取
-            import re
-            json_match = re.search(r'\{(?:[^{}]|(?R))*\}', result_text)
-            if not json_match:
-                # 备用方案：暴力查找第一对左右括号
-                start_idx = result_text.find('{')
-                end_idx = result_text.rfind('}')
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    result_text = result_text[start_idx:end_idx+1]
-                else:
-                    self.logger().warning(f"AI回答中未发现JSON内容: {result_text}")
-                    return
+            # 抛弃所有正则，防止旧版 Python 不支持
+            start_idx = result_text.find('{')
+            end_idx = result_text.rfind('}')
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                result_text = result_text[start_idx:end_idx+1]
             else:
-                result_text = json_match.group(0)
+                self.logger().warning(f"AI回答中未发现JSON内容: {result_text}")
+                return
                 
             decision = json.loads(result_text.strip())
             
