@@ -56,6 +56,18 @@ class BitfinexAPI:
                 except Exception:
                     return {"raw_text": text}
 
+    async def get_available_balance(self) -> float:
+        # 获取衍生品(margin)账户的可用 Tether 余额
+        resp = await self.request("/auth/r/wallets")
+        if isinstance(resp, list):
+            for w in resp:
+                # w 返回结构: [WALLET_TYPE, CURRENCY, BALANCE, UNSETTLED_INTEREST, BALANCE_AVAILABLE]
+                if len(w) >= 5 and w[0] == "margin" and w[1] in ["USTF0", "UST", "USDt", "USD"]:
+                    available = w[4]
+                    if available is not None:
+                        return float(available)
+        return 0.0
+
     async def get_ticker(self, symbol: str) -> float:
         # 获取Bitfinex真实最新价(解决与OKX之间的巨大价差引起的秒穿止损问题)
         url = f"{self.base_url}/ticker/{symbol}"
@@ -125,11 +137,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
     # 💥 必须配置的杠杆倍数 (Bitfinex合约，请根据风险承受度设定，默认为80倍高频滚仓)
     leverage = 80
     
-    # 💥 单次给 AI 下单的最小美元估值 (比如每次下单买 10 USDT 的比特币头寸)
-    min_order_notional = 10
-    
-    # 💥 最大持仓市值上限 (达到 1200 USDT 以后，就算AI喊破喉咙要加仓，机器人也会无视)
-    max_position_notional = 1200
+    # 💥 动态滚仓资金利用率 (0.98 = 提取衍生品账户里 98% 的可用资金乘以杠杆去开单！真正实现复利滚仓)
+    order_amount_pct = 0.98
     
     # 💥 止盈百分比设定 (例如: 0.5 = 如果价格顺向盈利 0.5%，大模型就会指示平仓离场)
     ai_take_profit_pct = 0.5
@@ -347,16 +356,30 @@ class AiRolloverStrategy(ScriptStrategyBase):
                         
                     if bfx_mid_price <= 0:
                         bfx_mid_price = float(self.connectors[self.data_exchange].get_price_by_type(self.trading_pair, PriceType.MidPrice))
-                    
-                    # AI只负责想出要做多还是做空。到底买多少数量是在这里算出来的！
-                    # 使用微调区的 min_order_notional（比如每次买 10 USDT 等值数量）
-                    amount_val = self.min_order_notional / bfx_mid_price
+                        
+                    # 💰 动态复利滚仓获取余额环节:
+                    try:
+                        available_balance = await self.bitfinex.get_available_balance()
+                    except Exception as e:
+                        available_balance = 0.0
+                        self.logger().warning(f"获取余额失败: {e}")
+                        
+                    if available_balance < 2.0:
+                        self.logger().warning(f"衍生品钱包可用余额不足 (${available_balance})，暂不建仓！(或者已有旧仓位锁定了资金)。请充值或划转")
+                        return
+
+                    # 动态计算: 账户可支配余额 * 杠杆 * 资金利用率 (%98)
+                    dynamic_notional = available_balance * self.leverage * self.order_amount_pct
+                    self.logger().info(f"💰 账户可用余额: {available_balance} U | 杠杆: {self.leverage}x | 算出本次最大开仓名义价值: ${dynamic_notional:.2f}")
+
+                    # 换算成 BTC 数量
+                    amount_val = dynamic_notional / bfx_mid_price
                     amount_val = max(0.0001, round(amount_val, 4))
                     
                     # 提交时，买单为正，卖（做空）单为负数
                     submit_amount = amount_val if side == "buy" else -amount_val
                     
-                    self.logger().info(f"⚡ AI触发由代码折算下单量: {submit_amount} BTC (名义价值: ${self.min_order_notional})")
+                    self.logger().info(f"⚡ AI触发由代码折算极速下单: {submit_amount} BTC (名义价值: ${dynamic_notional:.2f})")
                     
                     res = await self.bitfinex.create_order(
                         symbol=self.bfx_symbol,
