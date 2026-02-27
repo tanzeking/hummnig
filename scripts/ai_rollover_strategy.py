@@ -140,8 +140,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
             asyncio.ensure_future(self._execute_trade_by_decision())
             
     async def _call_ai_for_decision(self):
-        if not self.candles[0].is_ready:
-            self.logger().info("⏳ 正在等待币安 K 线数据加载完毕...")
+        if not getattr(self.candles[0], "is_ready", getattr(self.candles[0], "ready", False)):
+            self.logger().info("⏳ 正在等待 OKX K 线数据加载完毕...")
             return
             
         try:
