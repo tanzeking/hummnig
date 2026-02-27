@@ -288,8 +288,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
                     await self._place_tp_sl_orders(
                         entry_price=mid_price,
                         amount=submit_amount,
-                        tp_pct=decision.get("take_profit_pct", 5.0),
-                        sl_pct=decision.get("stop_loss_pct", 1.5)
+                        tp_pct=decision.get("take_profit_pct", 0.5),
+                        sl_pct=decision.get("stop_loss_pct", 0.2)
                     )
                     
         except Exception as e:
