@@ -90,9 +90,9 @@ class AiRolloverStrategy(ScriptStrategyBase):
     trading_pair = "BTC-USDT"
     markets = {data_exchange: {trading_pair}}
 
-    leverage = 20
+    leverage = 80
     min_order_notional = 10
-    max_position_notional = 180
+    max_position_notional = 800
     
     ai_request_interval = 5
     ai_temperature = 0.35
@@ -218,7 +218,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
         
     def _build_prompt(self, market_data: Dict[str, Any]) -> str:
         return f"""
-        你是交易AI。当前杠杆20级。根据以下数据出决策：
+        你是交易AI。当前杠杆80级。根据以下数据出决策：
         {json.dumps(market_data, ensure_ascii=False)}
         必须严格按此JSON格式回复：
         {{
