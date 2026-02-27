@@ -12,6 +12,7 @@ import pandas as pd
 from hummingbot.core.clock import Clock
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesConfig, CandlesFactory
+from hummingbot.core.data_type.common import PriceType
 
 # 手动加载 .env (绕开 dotenv 及其可能引发的任何依赖问题)
 env_path = "/home/hummingbot/.env"
@@ -208,8 +209,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
             kline_df_for_ai = candles_df.tail(self.kline_count_for_ai)
             ai_kline_data = kline_df_for_ai[["open", "high", "low", "close", "volume"]].values.tolist() if not kline_df_for_ai.empty else []
 
-            order_book = self.connectors[self.data_exchange].get_order_book(self.trading_pair)
-            mid_price = float(order_book.mid_price)
+            # 从连接器获取正确的中间价
+            mid_price = float(self.connectors[self.data_exchange].get_price_by_type(self.trading_pair, PriceType.MidPrice))
 
             trend_stats = {}
             if not candles_df.empty:
@@ -272,8 +273,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 if not self.current_position:
                     side = "buy" if decision["direction"] == "long" else "sell"
                     
-                    order_book = self.connectors[self.data_exchange].get_order_book(self.trading_pair)
-                    mid_price = float(order_book.mid_price)
+                    # 从连接器拿到正确的中间价格
+                    mid_price = float(self.connectors[self.data_exchange].get_price_by_type(self.trading_pair, PriceType.MidPrice))
                     
                     notional = self.max_position_notional * 0.5
                     amount_val = notional / mid_price
