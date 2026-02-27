@@ -1,108 +1,149 @@
 import os
 import json
 import asyncio
+import time
+import hmac
+import hashlib
 import aiohttp
 from typing import Dict, Any, Optional
 
-import ccxt.async_support as ccxt
 import pandas as pd
-from dotenv import load_dotenv
 
 from hummingbot.core.clock import Clock
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
-from hummingbot.data_feed.candles_feed.candles_factory import CandlesConfig
 
-load_dotenv()
+# 手动加载 .env (绕开 dotenv 及其可能引发的任何依赖问题)
+env_path = "/home/hummingbot/.env"
+if os.path.exists(env_path):
+    with open(env_path, "r", encoding="utf8") as f:
+        for line in f:
+            if line.strip() and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ[k.strip()] = v.strip().strip("'\"")
 
-# NVIDIA NIM API 配置
 NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "minimaxai/minimax-m2.5")
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+
+class BitfinexAPI:
+    """极其轻量的Bitfinex Async REST客户端，完全抛弃臃肿缓慢的CCXT"""
+    def __init__(self, api_key: str, api_secret: str):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = "https://api.bitfinex.com/v2"
+
+    async def request(self, endpoint: str, payload_dict: dict = None):
+        url = self.base_url + endpoint
+        nonce = str(int(time.time() * 1000000))
+        body = json.dumps(payload_dict) if payload_dict else "{}"
+        
+        signature_payload = f"/api/v2{endpoint}{nonce}{body}"
+        sig = hmac.new(self.api_secret.encode('utf8'), signature_payload.encode('utf8'), hashlib.sha384).hexdigest()
+        
+        headers = {
+            "bfx-nonce": nonce,
+            "bfx-apikey": self.api_key,
+            "bfx-signature": sig,
+            "content-type": "application/json"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=body) as resp:
+                text = await resp.text()
+                try:
+                    return json.loads(text)
+                except Exception:
+                    return {"raw_text": text}
+
+    async def set_leverage(self, symbol, leverage):
+        return await self.request("/auth/w/deriv/collateral/set", {"symbol": symbol, "leverage": int(leverage)})
+
+    async def create_order(self, symbol, order_type, amount, price=None, reduce_only=False):
+        # Bitfinex 要求 amount 为正表示买，为负表示卖
+        req = {
+            "type": order_type.upper(),
+            "symbol": symbol,
+            "amount": str(amount),
+        }
+        if price:
+            req["price"] = str(price)
+        if reduce_only:
+            req["flags"] = 1024 # 1024 代表 Reduce Only
+        
+        return await self.request("/auth/w/order/submit", req)
+
+    async def fetch_open_orders(self, symbol):
+        resp = await self.request("/auth/r/orders")
+        if isinstance(resp, list):
+            # 过滤出符合symbol的订单
+            return [o for o in resp if len(o) > 3 and o[3] == symbol]
+        return []
+
+    async def cancel_order(self, order_id):
+        return await self.request("/auth/w/order/cancel", {"id": int(order_id)})
 
 class AiRolloverStrategy(ScriptStrategyBase):
     """
-    AI高频滚仓策略 (Bitfinex)
-    由于Hummingbot未原生支持Bitfinex合约，本策略使用binance数据源收集K线，
-    并通过CCXT异步提交订单到Bitfinex。
+    终极版AI高频滚仓策略 (Bitfinex原生无依赖版)
     """
-    
-    # 使用Binance永续作为数据源，因为它的数据最稳定，跟Bitfinex价格差距极小
     data_exchange = "binance_perpetual"
     trading_pair = "BTC-USDT"
-    
     markets = {data_exchange: {trading_pair}}
 
-    # 交易参数
     leverage = 20
     min_order_notional = 10
     max_position_notional = 180
     
-    # AI参数
     ai_request_interval = 5
     ai_temperature = 0.35
     kline_count_for_ai = 20
     
-    # 系统状态
     last_ai_request_time = 0
     latest_ai_decision = None
     circuit_break_triggered = False
     
-    # CCXT 实例
+    # Bitfinex永续合约的代号为 tBTCF0:USTF0
+    bfx_symbol = "tBTCF0:USTF0"
     bitfinex = None
     current_position = None
 
     def __init__(self, connectors: Dict[str, Any]):
         super().__init__(connectors)
-        # 初始化CCXT
-        self.bitfinex = ccxt.bitfinex({
-            "apiKey": os.getenv("BITFINEX_API_KEY"),
-            "secret": os.getenv("BITFINEX_API_SECRET"),
-            "enableRateLimit": True,
-            "options": {"defaultType": "swap"}
-        })
+        api_key = os.getenv("BITFINEX_API_KEY", "")
+        api_secret = os.getenv("BITFINEX_API_SECRET", "")
+        self.bitfinex = BitfinexAPI(api_key, api_secret)
 
     def on_start(self):
-        """策略启动时的回调"""
-        self.logger().info("正在启动AI滚仓策略...")
-        try:
-            # 尝试设置杠杆
-            asyncio.ensure_future(self._init_bitfinex())
-        except Exception as e:
-            self.logger().error(f"初始化Bitfinex异常: {str(e)}")
+        self.logger().info("正在启动AI无依赖原生直连版滚仓策略...")
+        asyncio.ensure_future(self._init_bitfinex())
 
     async def _init_bitfinex(self):
         try:
-            # CCXT 异步设置杠杆
-            await self.bitfinex.set_leverage(self.leverage, "BTC/USDT:USDT")
-            self.logger().info(f"成功将Bitfinex BTC/USDT合约杠杆设置为: {self.leverage}x")
+            res = await self.bitfinex.set_leverage(self.bfx_symbol, self.leverage)
+            self.logger().info(f"成功将Bitfinex杠杆设置为: {self.leverage}x")
         except Exception as e:
-            self.logger().warning(f"设置杠杆失败，请确认账户可用: {str(e)}")
+            self.logger().warning(f"设置杠杆请求未能确认，请确保APIKey权限正常: {str(e)}")
 
     def on_tick(self):
-        """每一秒执行的Tick逻辑"""
         if self.circuit_break_triggered:
             return
 
         current_time = self.current_timestamp
         
-        # 定期调用AI
         if current_time - self.last_ai_request_time >= self.ai_request_interval:
             asyncio.ensure_future(self._call_ai_for_decision())
             self.last_ai_request_time = current_time
             
-        # 根据AI决策执行
         if self.latest_ai_decision is not None:
             asyncio.ensure_future(self._execute_trade_by_decision())
             
     async def _call_ai_for_decision(self):
-        """调用 NVIDIA NIM + MiniMax"""
         try:
-            # 获取市场数据
             market_data = self._get_market_data()
             if not market_data:
                 return
 
             prompt = self._build_prompt(market_data)
-            # 改用原生 aiohttp 请求 NVIDIA NIM（完美规避 openai sdk 的依赖冲突）
+            
             url = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
             if not url.endswith("/chat/completions"):
                 url = url.rstrip("/") + "/chat/completions"
@@ -126,10 +167,9 @@ class AiRolloverStrategy(ScriptStrategyBase):
             if "choices" in resp_json and len(resp_json["choices"]) > 0:
                 result_text = resp_json["choices"][0]["message"]["content"]
             else:
-                self.logger().warning(f"AI返回格式异常: {resp_json}")
+                self.logger().warning(f"AI返回异常: {str(resp_json)[:100]}")
                 return
             
-            # 过滤 possible markdown 包裹
             if "```json" in result_text:
                 result_text = result_text.split("```json")[1].split("```")[0]
             elif "```" in result_text:
@@ -144,36 +184,27 @@ class AiRolloverStrategy(ScriptStrategyBase):
         except asyncio.TimeoutError:
             self.logger().warning("AI请求超时。")
         except Exception as e:
-            self.logger().error(f"AI决策异常: {str(e)}")
+            self.logger().error(f"AI解析异常: {str(e)}")
             
     def _get_market_data(self) -> Dict[str, Any]:
-        """获取并格式化实时行情数据喂给AI"""
         try:
-            # 1. K线数据 (Binance Perpetual)
-            candles_df = self.connectors[self.data_exchange].get_candles_df(
-                self.trading_pair, "1m", self.kline_count_for_ai
-            )
-            
-            # 使用列表，降低Token
+            candles_df = self.connectors[self.data_exchange].get_candles_df(self.trading_pair, "1m", self.kline_count_for_ai)
             ai_kline_data = candles_df[["open", "high", "low", "close", "volume"]].values.tolist() if not candles_df.empty else []
 
-            # 2. 订单簿中位价
             order_book = self.connectors[self.data_exchange].get_order_book(self.trading_pair)
-            mid_price = order_book.mid_price
+            mid_price = float(order_book.mid_price)
 
-            # 3. 本地计算长周期趋势 (预处理以省Token)
             long_candles_df = self.connectors[self.data_exchange].get_candles_df(self.trading_pair, "1m", 100)
             trend_stats = {}
             if not long_candles_df.empty:
                 closes = long_candles_df["close"]
-                trend_stats["100ma"] = closes.mean()
-                trend_stats["24h_volatility_pct"] = (long_candles_df["high"].max() - long_candles_df["low"].min()) / closes.mean() * 100
+                trend_stats["100ma"] = float(closes.mean())
+                trend_stats["24h_volatility_pct"] = float((long_candles_df["high"].max() - long_candles_df["low"].min()) / closes.mean() * 100)
 
-            # 4. 当前仓位状态
             pos_info = "No position"
             if getattr(self, "current_position", None):
                 pos = self.current_position
-                pos_info = f"{pos.get('side')} entry:{pos.get('price')} amount:{pos.get('amount')}"
+                pos_info = f"{pos.get('side')} entry:{pos.get('price')} BTC:{pos.get('amount')}"
 
             return {
                 "current_price": round(mid_price, 2),
@@ -181,16 +212,14 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 "trend_stats": trend_stats,
                 "current_position": pos_info,
             }
-        except Exception as e:
-            self.logger().error(f"获取行情异常: {str(e)}")
+        except Exception:
             return {}
         
     def _build_prompt(self, market_data: Dict[str, Any]) -> str:
         return f"""
-        你是交易AI。当前杠杆20。根据以下数据判断：
+        你是交易AI。当前杠杆20级。根据以下数据出决策：
         {json.dumps(market_data, ensure_ascii=False)}
-        
-        必须只输出标准JSON：
+        必须严格按此JSON格式回复：
         {{
             "direction": "long/short/hold",
             "confidence": 0-100,
@@ -206,58 +235,51 @@ class AiRolloverStrategy(ScriptStrategyBase):
         return True
 
     async def _execute_trade_by_decision(self):
-        """执行通过CCXT下单，并挂止盈止损单"""
         decision = self.latest_ai_decision
-        self.latest_ai_decision = None # 消耗决策
+        self.latest_ai_decision = None
         
         try:
-            # 1. 检查方向是否需要平仓
             if decision.get("close_current_position") or decision.get("direction") == "hold":
                 if self.current_position:
-                    self.logger().info("🚨 AI要求平仓或观望，执行平仓！")
+                    self.logger().info("🚨 AI预警平仓/观望阶段，立刻清仓！")
                     await self._close_position()
                 return
 
-            # 如果当前有仓位，判断是否需要反向开仓（先平再开）
             if self.current_position:
                 current_side = "long" if self.current_position["amount"] > 0 else "short"
                 if current_side != decision["direction"]:
-                    self.logger().info(f"🔄 AI方向反转 ({current_side} -> {decision['direction']})，先平仓！")
+                    self.logger().info(f"🔄 AI极速变单 ({current_side} -> {decision['direction']})，反转清仓！")
                     await self._close_position()
 
-            # 2. 满足条件即开仓
             if decision.get("direction") in ["long", "short"] and decision.get("confidence", 0) >= 70:
                 if not self.current_position:
-                    side = 'buy' if decision["direction"] == "long" else 'sell'
+                    side = "buy" if decision["direction"] == "long" else "sell"
                     
-                    # 获取现价用于计算
                     order_book = self.connectors[self.data_exchange].get_order_book(self.trading_pair)
                     mid_price = float(order_book.mid_price)
                     
-                    # 以10U本金计算名义价值，再结合杠杆20倍 (最多开200U，受限于配置的min/max)
-                    notional = self.max_position_notional * 0.5  # 假设一次开仓占可用最大名义的一半
-                    amount = notional / mid_price
-                    amount = max(0.0001, round(amount, 4)) # BTC精度控制
+                    notional = self.max_position_notional * 0.5
+                    amount_val = notional / mid_price
+                    amount_val = max(0.0001, round(amount_val, 4))
                     
-                    self.logger().info(f"⚡ AI触发开仓 -> 方向: {side} | 数量: {amount} BTC")
+                    # 提交时，买单为正，卖（做空）单为负数
+                    submit_amount = amount_val if side == "buy" else -amount_val
                     
-                    # Bitfinex 永续合约下单参数 (市价单入场)
-                    order = await self.bitfinex.create_order(
-                        symbol="BTC/USDT:USDT",
-                        type="market",
-                        side=side,
-                        amount=amount
+                    self.logger().info(f"⚡ AI触发开仓 -> 真实下单量: {submit_amount} BTC")
+                    
+                    res = await self.bitfinex.create_order(
+                        symbol=self.bfx_symbol,
+                        order_type="MARKET",
+                        amount=submit_amount
                     )
                     
-                    self.logger().info(f"✅ 开仓成功: {order['id']}")
-                    self.current_position = {"side": decision["direction"], "amount": amount, "price": mid_price}
+                    self.logger().info(f"✅ 开仓市价单触发 (服务器已确认接收)")
+                    self.current_position = {"side": decision["direction"], "amount": submit_amount, "price": mid_price}
                     
-                    # 开仓后，立即挂条件平仓单（止盈止损三重屏障）
                     await self._place_tp_sl_orders(
                         entry_price=mid_price,
-                        amount=amount,
-                        side=side,
-                        tp_pct=decision.get("take_profit_pct", 2.0),
+                        amount=submit_amount,
+                        tp_pct=decision.get("take_profit_pct", 5.0),
                         sl_pct=decision.get("stop_loss_pct", 1.5)
                     )
                     
@@ -265,69 +287,64 @@ class AiRolloverStrategy(ScriptStrategyBase):
             self.logger().error(f"执行交易异常: {str(e)}")
 
     async def _close_position(self):
-        """完全平掉当前仓位"""
         if not self.current_position:
             return
             
-        side = 'sell' if self.current_position["side"] == "long" else 'buy'
-        amount = abs(self.current_position["amount"])
+        current_amount = float(self.current_position["amount"])
+        # 平仓吃掉目前仓位，数量完全相反
+        close_amount = -current_amount
+        
         try:
-            order = await self.bitfinex.create_order(
-                symbol="BTC/USDT:USDT",
-                type="market",
-                side=side,
-                amount=amount,
-                params={"reduceOnly": True}
+            res = await self.bitfinex.create_order(
+                symbol=self.bfx_symbol,
+                order_type="MARKET",
+                amount=close_amount,
+                reduce_only=True
             )
-            self.logger().info(f"✅ 平仓成功: {order['id']}")
+            self.logger().info(f"✅ 平仓触发成功")
             self.current_position = None
             
-            # 撤销所有未完成的止盈止损单
-            open_orders = await self.bitfinex.fetch_open_orders("BTC/USDT:USDT")
+            open_orders = await self.bitfinex.fetch_open_orders(self.bfx_symbol)
             for o in open_orders:
-                await self.bitfinex.cancel_order(o['id'], "BTC/USDT:USDT")
+                order_id = o[0] # Bitfinex 返回的是数组 [ID, GID, CID, ...]
+                await self.bitfinex.cancel_order(order_id)
+                self.logger().info(f"已清理附带追踪订单: ID {order_id}")
                 
         except Exception as e:
-            self.logger().error(f"平仓异常: {str(e)}")
+            self.logger().error(f"紧急平仓异常: {str(e)}")
 
-    async def _place_tp_sl_orders(self, entry_price: float, amount: float, side: str, tp_pct: float, sl_pct: float):
-        """挂止盈止损条件单"""
-        # 平仓方向
-        close_side = 'sell' if side == 'buy' else 'buy'
+    async def _place_tp_sl_orders(self, entry_price: float, amount: float, tp_pct: float, sl_pct: float):
+        # 平仓侧的数量符号刚好取反
+        close_amount = -float(amount)
         
-        # 计算价格
-        if side == 'buy':
+        # 价格如果是做多，止盈加止损减
+        if amount > 0:
             tp_price = entry_price * (1 + tp_pct / 100)
             sl_price = entry_price * (1 - sl_pct / 100)
         else:
             tp_price = entry_price * (1 - tp_pct / 100)
             sl_price = entry_price * (1 + sl_pct / 100)
             
-        # 挂单
         try:
-            # 止盈单 (Limit单)
             await self.bitfinex.create_order(
-                symbol="BTC/USDT:USDT",
-                type="limit",
-                side=close_side,
-                amount=amount,
+                symbol=self.bfx_symbol,
+                order_type="LIMIT",
+                amount=close_amount,
                 price=tp_price,
-                params={"reduceOnly": True}
+                reduce_only=True
             )
             
-            # 止损单 (Stop单)
             await self.bitfinex.create_order(
-                symbol="BTC/USDT:USDT",
-                type="stop",
-                side=close_side,
-                amount=amount,
-                price=sl_price, # 触发价
-                params={"reduceOnly": True}
+                symbol=self.bfx_symbol,
+                order_type="STOP",
+                amount=close_amount,
+                price=sl_price,
+                reduce_only=True
             )
-            self.logger().info(f"🛡️ 止盈({round(tp_price, 2)}) & 止损({round(sl_price, 2)}) 挂单成功！")
+            self.logger().info(f"🛡️ 止盈线(${round(tp_price, 2)}) & 止损线(${round(sl_price, 2)}) 战壕构建完毕！")
         except Exception as e:
-            self.logger().error(f"挂止盈止损单异常: {str(e)}")
+            self.logger().error(f"防御挂单建立失败: {str(e)}")
 
     def format_status(self) -> str:
-        pos_str = f"{self.current_position}" if self.current_position else "空仓"
-        return f"AI 策略运行中 | 目标交易所: Bitfinex | AI: {NVIDIA_MODEL} \n当前仓位: {pos_str}"
+        pos_str = f"方向:{self.current_position['side']} 余额:{self.current_position['amount']} 均价:{self.current_position['price']}" if self.current_position else "极度冷静，空仓等待中"
+        return f"⚡ AI原生直连策略运行中 | Bitfinex | AI驱动核心: {NVIDIA_MODEL} \n仓位情况: {pos_str}"

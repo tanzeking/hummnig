@@ -3,8 +3,7 @@ FROM hummingbot/hummingbot:latest
 # 更新并在官方镜像基础上安装策略必备依赖库
 USER root
 
-RUN apt-get update && apt-get install -y gcc \
-    && /opt/conda/envs/hummingbot/bin/pip install --no-cache-dir protobuf==4.25.3 ccxt python-dotenv pandas
+# 只覆盖汉化过的源码，其它什么包都不额外安装
 
 # 将我们汉化过的源码覆盖到镜像中
 COPY ./hummingbot /home/hummingbot/hummingbot
