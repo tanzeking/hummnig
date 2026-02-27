@@ -66,7 +66,7 @@ def test_ai():
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.35,
         "top_p": 0.85,
-        "max_tokens": 512
+        "max_tokens": 4096
     }
     
     req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
@@ -87,6 +87,9 @@ def test_ai():
 
     print("\n--- 正则提取与验证 ---")
     
+    if "</think>" in result_text:
+        result_text = result_text.split("</think>")[1]
+        
     start_idx = result_text.find('{')
     end_idx = result_text.rfind('}')
     

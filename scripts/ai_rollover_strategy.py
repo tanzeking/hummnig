@@ -178,7 +178,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": self.ai_temperature,
                 "top_p": 0.85,
-                "max_tokens": 512
+                "max_tokens": 4096
             }
             
             async with aiohttp.ClientSession() as session:
@@ -190,6 +190,9 @@ class AiRolloverStrategy(ScriptStrategyBase):
             else:
                 self.logger().warning(f"AI返回异常: {str(resp_json)[:100]}")
                 return
+            
+            if "</think>" in result_text:
+                result_text = result_text.split("</think>")[1]
             
             # 兼容老版本 Python 3.6 的基础正则 JSON 提取
             import re
