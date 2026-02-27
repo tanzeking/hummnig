@@ -70,8 +70,12 @@ class BitfinexAPI:
             req["price"] = str(price)
         if reduce_only:
             req["flags"] = 1024 # 1024 代表 Reduce Only
+            
+        resp = await self.request("/auth/w/order/submit", req)
         
-        return await self.request("/auth/w/order/submit", req)
+        # 增加超级详细的日志，打印 Bitfinex 原生下单接口返回了什么，避免静默失败
+        print(f"[{symbol}下单API返回] => {resp}")
+        return resp
 
     async def fetch_open_orders(self, symbol):
         resp = await self.request("/auth/r/orders")
@@ -187,10 +191,14 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 self.logger().warning(f"AI返回异常: {str(resp_json)[:100]}")
                 return
             
-            if "```json" in result_text:
-                result_text = result_text.split("```json")[1].split("```")[0]
-            elif "```" in result_text:
-                result_text = result_text.split("```")[1].split("```")[0]
+            # 使用最强力的正则提取JSON，防止AI回答混杂其他废话
+            import re
+            json_match = re.search(r'\{(?:[^{}]|(?(?=\{).*?\}))*\}', result_text, re.DOTALL)
+            if json_match:
+                result_text = json_match.group(0)
+            else:
+                self.logger().warning(f"AI回答中未发现JSON内容: {result_text}")
+                return
                 
             decision = json.loads(result_text.strip())
             
