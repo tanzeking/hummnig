@@ -4,7 +4,7 @@ import asyncio
 import re
 import urllib.request
 
-async def test_ai():
+def test_ai():
     # 模拟读取 .env
     env_path = ".env"
     if os.path.exists(env_path):
@@ -101,6 +101,4 @@ async def test_ai():
         print("❌ 未在返回结果中提取到包围在 {} 的 JSON数据!")
 
 if __name__ == "__main__":
-    if os.name == "nt":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(test_ai())
+    test_ai()
