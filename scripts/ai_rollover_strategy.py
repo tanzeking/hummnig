@@ -56,6 +56,18 @@ class BitfinexAPI:
                 except Exception:
                     return {"raw_text": text}
 
+    async def get_ticker(self, symbol: str) -> float:
+        # 获取Bitfinex真实最新价(解决与OKX之间的巨大价差引起的秒穿止损问题)
+        url = f"{self.base_url}/ticker/{symbol}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                # Bitfinex Ticker 数组下标 6 对应最新价 (LAST_PRICE，或对衍生品是 6/7)
+                # Ticker数组返回格式为: [BID, BID_SIZE, ASK, ASK_SIZE, DAILY_CHANGE, DAILY_CHANGE_RELATIVE, LAST_PRICE, VOLUME, HIGH, LOW]
+                if isinstance(data, list) and len(data) >= 7:
+                    return float(data[6])
+                return 0.0
+
     async def set_leverage(self, symbol, leverage):
         # 为衍生品合约更新杠杆倍数
         return await self.request("/auth/w/deriv/collateral/set", {"symbol": symbol, "dir": 1, "leverage": int(leverage)})
@@ -325,18 +337,26 @@ class AiRolloverStrategy(ScriptStrategyBase):
             if decision.get("direction") in ["long", "short"] and decision.get("confidence", 0) >= 70:
                 if not self.current_position:
                     side = "buy" if decision["direction"] == "long" else "sell"
+                    # ⚠️从连接器拿到的是 OKX 的数据，有上百刀差价，会导致直接穿仓！
+                    # 所以，我们现在改为实时获取 Bitfinex 原生极速盘口价格做为入场基准价
+                    try:
+                        bfx_mid_price = await self.bitfinex.get_ticker(self.bfx_symbol)
+                    except Exception as e:
+                        self.logger().warning(f"获取Bitfinex原生价格失败，回退使用OKX定价: {e}")
+                        bfx_mid_price = float(self.connectors[self.data_exchange].get_price_by_type(self.trading_pair, PriceType.MidPrice))
+                        
+                    if bfx_mid_price <= 0:
+                        bfx_mid_price = float(self.connectors[self.data_exchange].get_price_by_type(self.trading_pair, PriceType.MidPrice))
                     
-                    # 从连接器拿到正确的中间价格
-                    mid_price = float(self.connectors[self.data_exchange].get_price_by_type(self.trading_pair, PriceType.MidPrice))
-                    
-                    notional = self.max_position_notional * 0.5
-                    amount_val = notional / mid_price
+                    # AI只负责想出要做多还是做空。到底买多少数量是在这里算出来的！
+                    # 使用微调区的 min_order_notional（比如每次买 10 USDT 等值数量）
+                    amount_val = self.min_order_notional / bfx_mid_price
                     amount_val = max(0.0001, round(amount_val, 4))
                     
                     # 提交时，买单为正，卖（做空）单为负数
                     submit_amount = amount_val if side == "buy" else -amount_val
                     
-                    self.logger().info(f"⚡ AI触发开仓 -> 真实下单量: {submit_amount} BTC")
+                    self.logger().info(f"⚡ AI触发由代码折算下单量: {submit_amount} BTC (名义价值: ${self.min_order_notional})")
                     
                     res = await self.bitfinex.create_order(
                         symbol=self.bfx_symbol,
@@ -345,12 +365,12 @@ class AiRolloverStrategy(ScriptStrategyBase):
                     )
                     
                     self.logger().info(f"✅ 开仓市价单触发 (服务器已确认接收)")
-                    self.current_position = {"side": decision["direction"], "amount": submit_amount, "price": mid_price}
+                    self.current_position = {"side": decision["direction"], "amount": submit_amount, "price": bfx_mid_price}
                     
                     # === 🎯 物理硬止损/止盈追踪单抛出 ===
-                    # 这一步负责接收 AI 刚才吐出的 0.5和0.2，并命令底层的 Hummingbot 立刻向挂单本里挂上极速止损保命单
+                    # 这一步基于刚才抓取的 Bitfinex 真实成交基准价来挂单，彻底解决两千刀价差问题！
                     await self._place_tp_sl_orders(
-                        entry_price=mid_price,
+                        entry_price=bfx_mid_price,
                         amount=submit_amount,
                         tp_pct=decision.get("take_profit_pct", self.ai_take_profit_pct),
                         sl_pct=decision.get("stop_loss_pct", self.ai_stop_loss_pct)
