@@ -11,6 +11,7 @@ import pandas as pd
 
 from hummingbot.core.clock import Clock
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+from hummingbot.data_feed.candles_feed.candles_factory import CandlesConfig, CandlesFactory
 
 # 手动加载 .env (绕开 dotenv 及其可能引发的任何依赖问题)
 env_path = "/home/hummingbot/.env"
@@ -89,6 +90,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
     data_exchange = "binance_paper_trade"
     trading_pair = "BTC-USDT"
     markets = {data_exchange: {trading_pair}}
+    candles = [CandlesFactory.get_candle(CandlesConfig(connector=data_exchange, trading_pair=trading_pair, interval="1m", max_records=200))]
 
     leverage = 80
     min_order_notional = 10
@@ -138,9 +140,14 @@ class AiRolloverStrategy(ScriptStrategyBase):
             asyncio.ensure_future(self._execute_trade_by_decision())
             
     async def _call_ai_for_decision(self):
+        if not self.candles[0].is_ready:
+            self.logger().info("⏳ 正在等待币安 K 线数据加载完毕...")
+            return
+            
         try:
             market_data = self._get_market_data()
             if not market_data:
+                self.logger().warning("获取行情失败，跳过此次操作")
                 return
 
             prompt = self._build_prompt(market_data)
@@ -189,18 +196,18 @@ class AiRolloverStrategy(ScriptStrategyBase):
             
     def _get_market_data(self) -> Dict[str, Any]:
         try:
-            candles_df = self.connectors[self.data_exchange].get_candles_df(self.trading_pair, "1m", self.kline_count_for_ai)
-            ai_kline_data = candles_df[["open", "high", "low", "close", "volume"]].values.tolist() if not candles_df.empty else []
+            candles_df = self.candles[0].candles_df
+            kline_df_for_ai = candles_df.tail(self.kline_count_for_ai)
+            ai_kline_data = kline_df_for_ai[["open", "high", "low", "close", "volume"]].values.tolist() if not kline_df_for_ai.empty else []
 
             order_book = self.connectors[self.data_exchange].get_order_book(self.trading_pair)
             mid_price = float(order_book.mid_price)
 
-            long_candles_df = self.connectors[self.data_exchange].get_candles_df(self.trading_pair, "1m", 100)
             trend_stats = {}
-            if not long_candles_df.empty:
-                closes = long_candles_df["close"]
-                trend_stats["100ma"] = float(closes.mean())
-                trend_stats["24h_volatility_pct"] = float((long_candles_df["high"].max() - long_candles_df["low"].min()) / closes.mean() * 100)
+            if not candles_df.empty:
+                long_closes = candles_df["close"].tail(100)
+                trend_stats["100ma"] = float(long_closes.mean())
+                trend_stats["24h_volatility_pct"] = float((candles_df["high"].max() - candles_df["low"].min()) / long_closes.mean() * 100)
 
             pos_info = "No position"
             if getattr(self, "current_position", None):
@@ -213,7 +220,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 "trend_stats": trend_stats,
                 "current_position": pos_info,
             }
-        except Exception:
+        except Exception as e:
+            self.logger().error(f"打包行情数据异常: {e}")
             return {}
         
     def _build_prompt(self, market_data: Dict[str, Any]) -> str:
