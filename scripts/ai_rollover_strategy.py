@@ -140,6 +140,11 @@ class AiRolloverStrategy(ScriptStrategyBase):
     # 💥 动态滚仓资金利用率 (0.98 = 提取衍生品账户里 98% 的可用资金乘以杠杆去开单！真正实现复利滚仓)
     order_amount_pct = 0.98
     
+    # 💥 当触发单边大资金开仓（可用余额大于多少U）时，启动“冰山/分批”极速开仓防滑点
+    split_order_threshold = 100
+    # 💥 触发大资金分批时的下单次数
+    split_order_count = 3
+    
     # 💥 止盈百分比设定 (例如: 0.5 = 如果价格顺向盈利 0.5%，大模型就会指示平仓离场)
     ai_take_profit_pct = 0.5
     
@@ -381,13 +386,35 @@ class AiRolloverStrategy(ScriptStrategyBase):
                     
                     self.logger().info(f"⚡ AI触发由代码折算极速下单: {submit_amount} BTC (名义价值: ${dynamic_notional:.2f})")
                     
-                    res = await self.bitfinex.create_order(
-                        symbol=self.bfx_symbol,
-                        order_type="MARKET",
-                        amount=submit_amount
-                    )
-                    
-                    self.logger().info(f"✅ 开仓市价单触发 (服务器已确认接收)")
+                    # 判断是否触发大额分批拆单逻辑
+                    if available_balance >= self.split_order_threshold and self.split_order_count > 1:
+                        split_num = self.split_order_count
+                        self.logger().info(f"❄️ 余额充足 (${available_balance} > {self.split_order_threshold} U)，开启冰山防滑点模式，准备分 {split_num} 次扫单...")
+                    else:
+                        split_num = 1
+                        
+                    # 计算切片大小（保留4位小数以满足BTC合约精度）
+                    piece_amount = round(submit_amount / split_num, 4)
+                    residual_amount = round(submit_amount - piece_amount * (split_num - 1), 4)
+
+                    for i in range(split_num):
+                        cur_amount = residual_amount if i == split_num - 1 else piece_amount
+                        
+                        # 兜底：如果切片太小就不下了
+                        if abs(cur_amount) < 0.0001:
+                            continue
+                            
+                        res = await self.bitfinex.create_order(
+                            symbol=self.bfx_symbol,
+                            order_type="MARKET",
+                            amount=cur_amount
+                        )
+                        self.logger().info(f"✅ 开仓市价单触发 (分片 {i+1}/{split_num} | 数量: {cur_amount} BTC)")
+                        
+                        # 每次切片打单后稍微停顿几百毫秒，给交易所引擎消化时间和滑点冷却
+                        if split_num > 1 and i < split_num - 1:
+                            await asyncio.sleep(0.3)
+                            
                     self.current_position = {"side": decision["direction"], "amount": submit_amount, "price": bfx_mid_price}
                     
                     # === 🎯 物理硬止损/止盈追踪单抛出 ===
