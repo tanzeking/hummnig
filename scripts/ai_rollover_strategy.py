@@ -114,14 +114,18 @@ class AiRolloverStrategy(ScriptStrategyBase):
         api_key = os.getenv("BITFINEX_API_KEY", "")
         api_secret = os.getenv("BITFINEX_API_SECRET", "")
         self.bitfinex = BitfinexAPI(api_key, api_secret)
-
-    def on_start(self):
-        self.logger().info("正在启动AI无依赖原生直连版滚仓策略...")
-        asyncio.ensure_future(self._init_bitfinex())
         
-        # 极为关键的一步：必须手动启动 CandlesFactory 生成的后台刷新进程！
+        # 必须在 __init__ 初始化时启动 K 线抓取，因为 ScriptStrategyBase 没有 on_start 钩子
         for candle_obj in self.candles:
             candle_obj.start()
+            
+        # 异步初始化杠杆
+        asyncio.ensure_future(self._init_bitfinex())
+
+    async def on_stop(self):
+        """停止策略时清理后台进程"""
+        for candle_obj in self.candles:
+            candle_obj.stop()
 
     async def _init_bitfinex(self):
         try:
