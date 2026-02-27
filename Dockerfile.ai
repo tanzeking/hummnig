@@ -6,3 +6,5 @@ USER root
 RUN apt-get update && apt-get install -y gcc \
     && pip install --no-cache-dir openai ccxt google-genai python-dotenv pandas
 
+# 将我们汉化过的源码覆盖到镜像中
+COPY ./hummingbot /home/hummingbot/hummingbot
