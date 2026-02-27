@@ -194,7 +194,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
         {{
             "direction": "long/short/hold",
             "confidence": 0-100,
-            "take_profit_pct": 2.0,
+            "take_profit_pct": 5.0,
             "stop_loss_pct": 1.5,
             "close_current_position": false
         }}
