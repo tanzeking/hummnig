@@ -118,6 +118,10 @@ class AiRolloverStrategy(ScriptStrategyBase):
     def on_start(self):
         self.logger().info("正在启动AI无依赖原生直连版滚仓策略...")
         asyncio.ensure_future(self._init_bitfinex())
+        
+        # 极为关键的一步：必须手动启动 CandlesFactory 生成的后台刷新进程！
+        for candle_obj in self.candles:
+            candle_obj.start()
 
     async def _init_bitfinex(self):
         try:
