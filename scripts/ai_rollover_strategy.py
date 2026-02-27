@@ -86,8 +86,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
     """
     终极版AI高频滚仓策略 (Bitfinex原生无依赖版)
     """
-    # 改用 binance_paper_trade (币安纸交易模式) 抓取行情，纸交易完全不需要任何API Key即可启动
-    data_exchange = "binance_paper_trade"
+    # 回滚回 binance，因为 binance_paper_trade 不是合法的独立连接器名字
+    data_exchange = "binance"
     trading_pair = "BTC-USDT"
     markets = {data_exchange: {trading_pair}}
     candles = [CandlesFactory.get_candle(CandlesConfig(connector=data_exchange, trading_pair=trading_pair, interval="1m", max_records=200))]
