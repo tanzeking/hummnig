@@ -4,7 +4,7 @@ FROM hummingbot/hummingbot:latest
 USER root
 
 RUN apt-get update && apt-get install -y gcc \
-    && /opt/conda/envs/hummingbot/bin/pip install --no-cache-dir openai ccxt python-dotenv pandas
+    && /opt/conda/envs/hummingbot/bin/pip install --no-cache-dir ccxt python-dotenv pandas
 
 # 将我们汉化过的源码覆盖到镜像中
 COPY ./hummingbot /home/hummingbot/hummingbot

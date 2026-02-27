@@ -1,9 +1,9 @@
 import os
 import json
 import asyncio
+import aiohttp
 from typing import Dict, Any, Optional
 
-from openai import AsyncOpenAI
 import ccxt.async_support as ccxt
 import pandas as pd
 from dotenv import load_dotenv
@@ -15,11 +15,8 @@ from hummingbot.data_feed.candles_feed.candles_factory import CandlesConfig
 load_dotenv()
 
 # NVIDIA NIM API 配置
-client = AsyncOpenAI(
-    base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
-    api_key=os.getenv("NVIDIA_API_KEY")
-)
 NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "minimaxai/minimax-m2.5")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 
 class AiRolloverStrategy(ScriptStrategyBase):
     """
@@ -105,17 +102,32 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 return
 
             prompt = self._build_prompt(market_data)
+            # 改用原生 aiohttp 请求 NVIDIA NIM（完美规避 openai sdk 的依赖冲突）
+            url = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+            if not url.endswith("/chat/completions"):
+                url = url.rstrip("/") + "/chat/completions"
+                
+            headers = {
+                "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": NVIDIA_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": self.ai_temperature,
+                "top_p": 0.85,
+                "max_tokens": 512
+            }
             
-            # 使用 openai 接口调用 NVIDIA NIM
-            response = await client.chat.completions.create(
-                model=NVIDIA_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=self.ai_temperature,
-                top_p=0.85,
-                max_tokens=512,
-            )
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    resp_json = await resp.json()
             
-            result_text = response.choices[0].message.content
+            if "choices" in resp_json and len(resp_json["choices"]) > 0:
+                result_text = resp_json["choices"][0]["message"]["content"]
+            else:
+                self.logger().warning(f"AI返回格式异常: {resp_json}")
+                return
             
             # 过滤 possible markdown 包裹
             if "```json" in result_text:
