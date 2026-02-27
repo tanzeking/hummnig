@@ -94,7 +94,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
 
     leverage = 80
     min_order_notional = 10
-    max_position_notional = 800
+    max_position_notional = 1200
     
     ai_request_interval = 5
     ai_temperature = 0.35
