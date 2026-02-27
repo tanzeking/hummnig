@@ -85,8 +85,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
     """
     终极版AI高频滚仓策略 (Bitfinex原生无依赖版)
     """
-    # 改用 binance (现货) 抓取行情，现货接口完全无需任何 API Key，大盘走势通用
-    data_exchange = "binance"
+    # 改用 binance_paper_trade (币安纸交易模式) 抓取行情，纸交易完全不需要任何API Key即可启动
+    data_exchange = "binance_paper_trade"
     trading_pair = "BTC-USDT"
     markets = {data_exchange: {trading_pair}}
 
