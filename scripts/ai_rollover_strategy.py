@@ -84,7 +84,7 @@ class BitfinexAPI:
         # 为衍生品合约更新杠杆倍数
         return await self.request("/auth/w/deriv/collateral/set", {"symbol": symbol, "dir": 1, "leverage": int(leverage)})
 
-    async def create_order(self, symbol, order_type, amount, price=None, reduce_only=False):
+    async def create_order(self, symbol, order_type, amount, price=None, reduce_only=False, lev=None):
         # 强制格式化处理，丢弃负面科学计数法例如 "1e-5"
         amount_str = "{:.6f}".format(float(amount))
         
@@ -96,6 +96,10 @@ class BitfinexAPI:
         }
         if price:
             req["price"] = str(price)
+        
+        # 💥 核心中的核心: 衍生品订单必须携带 lev 参数才能启动杠杆！否则默认只有 10x！
+        if lev is not None:
+            req["lev"] = int(lev)
             
         flags = 0
         if reduce_only:
@@ -137,8 +141,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
     # 💥 必须配置的杠杆倍数 (Bitfinex合约，请根据风险承受度设定，默认为80倍高频滚仓)
     leverage = 80
     
-    # 💥 动态滚仓资金利用率 (0.98 = 提取衍生品账户里 98% 的可用资金乘以杠杆去开单！真正实现复利滚仓)
-    order_amount_pct = 0.98
+    # 💥 动态滚仓资金利用率 (0.95 = 提取衍生品账户里 95% 的可用资金乘以杠杆去开单，Bitfinex无手续费，留 5% 防滑点)
+    order_amount_pct = 0.95
     
     # 💥 当触发单边大资金开仓（可用余额大于多少U）时，启动“冰山/分批”极速开仓防滑点
     split_order_threshold = 100
@@ -194,7 +198,11 @@ class AiRolloverStrategy(ScriptStrategyBase):
     async def _init_bitfinex(self):
         try:
             res = await self.bitfinex.set_leverage(self.bfx_symbol, self.leverage)
-            self.logger().info(f"成功将Bitfinex杠杆设置为: {self.leverage}x")
+            self.logger().info(f"✅ Bitfinex杠杆设置返回: {res}")
+            
+            # 开机就查一次余额，打在日志上确认API权限和钱包状态
+            bal = await self.bitfinex.get_available_balance()
+            self.logger().info(f"💰 开机自检: 衍生品钱包可用余额 = {bal} USDT")
         except Exception as e:
             self.logger().warning(f"设置杠杆请求未能确认，请确保APIKey权限正常: {str(e)}")
 
@@ -435,7 +443,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
                         res = await self.bitfinex.create_order(
                             symbol=self.bfx_symbol,
                             order_type="MARKET",
-                            amount=cur_amount
+                            amount=cur_amount,
+                            lev=self.leverage  # 💥 必须携带杠杆参数，否则默认只有 10x！
                         )
                         self.logger().info(f"✅ 开仓市价单触发 (分片 {i+1}/{split_num} | 数量: {cur_amount} BTC)")
                         
@@ -470,7 +479,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 symbol=self.bfx_symbol,
                 order_type="MARKET",
                 amount=close_amount,
-                # 注意：Bitfinex 若因极速交易导致还没有生成仓位就立刻调用 Reduce Only，会报错 Invalid Direction，这里设为False或依靠逻辑清仓
+                lev=self.leverage,  # 平仓也要携带杠杆参数
                 reduce_only=False
             )
             self.logger().info(f"✅ 平仓触发成功")
