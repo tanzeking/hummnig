@@ -57,7 +57,8 @@ class BitfinexAPI:
                     return {"raw_text": text}
 
     async def set_leverage(self, symbol, leverage):
-        return await self.request("/auth/w/deriv/collateral/set", {"symbol": symbol, "leverage": int(leverage)})
+        # 为衍生品合约更新杠杆倍数
+        return await self.request("/auth/w/deriv/collateral/set", {"symbol": symbol, "dir": 1, "leverage": int(leverage)})
 
     async def create_order(self, symbol, order_type, amount, price=None, reduce_only=False):
         # Bitfinex 要求 amount 为正表示买，为负表示卖
@@ -68,8 +69,13 @@ class BitfinexAPI:
         }
         if price:
             req["price"] = str(price)
+            
+        flags = 0
         if reduce_only:
-            req["flags"] = 1024 # 1024 代表 Reduce Only
+            flags |= 1024 # 1024 代表 Reduce Only
+            
+        if flags > 0:
+            req["flags"] = flags
             
         resp = await self.request("/auth/w/order/submit", req)
         
@@ -360,7 +366,8 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 symbol=self.bfx_symbol,
                 order_type="MARKET",
                 amount=close_amount,
-                reduce_only=True
+                # 注意：Bitfinex 若因极速交易导致还没有生成仓位就立刻调用 Reduce Only，会报错 Invalid Direction，这里设为False或依靠逻辑清仓
+                reduce_only=False
             )
             self.logger().info(f"✅ 平仓触发成功")
             self.current_position = None
