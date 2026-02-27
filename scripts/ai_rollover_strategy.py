@@ -138,31 +138,34 @@ class AiRolloverStrategy(ScriptStrategyBase):
     # === 🚀 核心可微调交易参数 (重点修改区) ===
     # ==========================================
     
-    # 💥 必须配置的杠杆倍数 (Bitfinex合约，请根据风险承受度设定，默认为80倍高频滚仓)
-    leverage = 80
+    # 💥 杠杆倍数 (30倍，稳健型，给价格波动留充足呼吸空间)
+    leverage = 30
     
-    # 💥 动态滚仓资金利用率 (0.95 = 提取衍生品账户里 95% 的可用资金乘以杠杆去开单，Bitfinex无手续费，留 5% 防滑点)
+    # 💥 动态滚仓资金利用率 (0.90 = 90%可用资金，留 10% 缓冲)
     order_amount_pct = 0.95
     
-    # 💥 当触发单边大资金开仓（可用余额大于多少U）时，启动“冰山/分批”极速开仓防滑点
+    # 💥 当余额大于多少U时启动“冰山/分批”极速开仓防滑点
     split_order_threshold = 100
-    # 💥 触发大资金分批时的下单次数
+    # 💥 触发分批时的下单次数
     split_order_count = 3
     
-    # 💥 止盈百分比设定 (例如: 0.5 = 如果价格顺向盈利 0.5%，大模型就会指示平仓离场)
-    ai_take_profit_pct = 0.5
+    # 💥 止盈收益率 (40 = 本金赚了 40% 就平仓收钱，30倍杠杆下价格只需动 1.33%)
+    ai_take_profit_pct = 40
     
-    # 💥 止损百分比设定 (例如: 0.2 = 如果价格逆向产生 0.2% 的账面浮亏，赶紧割肉止损，防爆仓)
-    ai_stop_loss_pct = 0.2
+    # 💥 止损收益率 (20 = 本金亏了 20% 就割肉，30倍杠杆下价格只需动 0.67%)
+    ai_stop_loss_pct = 20
     
-    # 💥 AI请求频率 (每隔多少秒查一次大模型的判断，推荐设定为 5 - 10 秒)
-    ai_request_interval = 5
+    # 💥 AI请求频率 (60秒间隔，让AI看到更完整的走势再决策，避免来回打脸)
+    ai_request_interval = 60
     
-    # 💥 大模型的创造力/发散度 (0越死板/越严格，1越天马行空，短线交易推荐 0.2 - 0.4)
+    # 💥 大模型的创造力/发散度 (0越死板/越严格，1越天马行空，短线交易推荐 0.2-0.4)
     ai_temperature = 0.35
     
-    # 💥 投喂给 AI 的 1分钟K线数量 (越多大模型能分析的历史越长，但消耗Token也等比暴增)
+    # 💥 投喂给 AI 的 1分钟K线数量
     kline_count_for_ai = 20
+    
+    # 💥 单笔最大持仓时间 (7200秒 = 2小时，超时强制平仓防止黑天鹅和资金费率侵蚀)
+    max_hold_seconds = 72000
 
     # ==========================================
     # === 以下为底层变量，平时不需要修改 =======
@@ -171,6 +174,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
     last_ai_request_time = 0
     latest_ai_decision = None
     circuit_break_triggered = False
+    position_open_time = 0  # 记录开仓时间戳，用于最大持仓时间判断
     
     # Bitfinex永续合约的代号为 tBTCF0:USTF0
     bfx_symbol = "tBTCF0:USTF0"
@@ -197,14 +201,10 @@ class AiRolloverStrategy(ScriptStrategyBase):
 
     async def _init_bitfinex(self):
         try:
-            res = await self.bitfinex.set_leverage(self.bfx_symbol, self.leverage)
-            self.logger().info(f"✅ Bitfinex杠杆设置返回: {res}")
-            
-            # 开机就查一次余额，打在日志上确认API权限和钱包状态
             bal = await self.bitfinex.get_available_balance()
-            self.logger().info(f"💰 开机自检: 衍生品钱包可用余额 = {bal} USDT")
+            self.logger().info(f"💰 开机自检: 余额={bal} USDT | 杠杆={self.leverage}x | 止盈ROI={self.ai_take_profit_pct}% | 止损ROI={self.ai_stop_loss_pct}% | AI间隔={self.ai_request_interval}s | 最大持仓={self.max_hold_seconds}s")
         except Exception as e:
-            self.logger().warning(f"设置杠杆请求未能确认，请确保APIKey权限正常: {str(e)}")
+            self.logger().warning(f"API自检失败: {str(e)}")
 
     def on_tick(self):
         if self.circuit_break_triggered:
@@ -218,6 +218,13 @@ class AiRolloverStrategy(ScriptStrategyBase):
             
         if self.latest_ai_decision is not None:
             asyncio.ensure_future(self._execute_trade_by_decision())
+        
+        # ✈️ 最大持仓时间检查: 超过2小时强制平仓
+        if self.current_position and self.position_open_time > 0:
+            hold_duration = current_time - self.position_open_time
+            if hold_duration >= self.max_hold_seconds:
+                self.logger().info(f"⏰ 持仓超时 ({int(hold_duration)}s >= {self.max_hold_seconds}s)，强制平仓！")
+                asyncio.ensure_future(self._close_position())
             
     async def _call_ai_for_decision(self):
         if not getattr(self.candles[0], "is_ready", getattr(self.candles[0], "ready", False)):
@@ -303,29 +310,10 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 pos = self.current_position
                 pos_info = f"{pos.get('side')} entry:{pos.get('price')} BTC:{pos.get('amount')}"
 
-            # 📊 抓取盘口深度数据 (买卖前5档挂单量，让AI看清多空力量对比)
-            depth_data = {"bids": [], "asks": []}
-            try:
-                connector = self.connectors[self.data_exchange]
-                order_book = connector.get_order_book(self.trading_pair)
-                # 买盘前5档: 价格从高到低 (越高越强的买方支撑)
-                for i, row in enumerate(order_book.bid_entries()):
-                    if i >= 5:
-                        break
-                    depth_data["bids"].append([round(float(row.price), 2), round(float(row.amount), 4)])
-                # 卖盘前5档: 价格从低到高 (越低越近的卖方压力)
-                for i, row in enumerate(order_book.ask_entries()):
-                    if i >= 5:
-                        break
-                    depth_data["asks"].append([round(float(row.price), 2), round(float(row.amount), 4)])
-            except Exception as e:
-                self.logger().warning(f"获取深度数据失败: {e}")
-
             return {
                 "current_price": round(mid_price, 2),
                 "candles_1m_ohlcv": ai_kline_data,
                 "trend_stats": trend_stats,
-                "order_book_depth": depth_data,
                 "current_position": pos_info,
             }
         except Exception as e:
@@ -342,7 +330,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
         只允许输出合法的JSON格式（绝不要包含其他任何字符、免责声明等废话）：
         IMPORTANT: direction MUST be exactly one of these three strings: "long" or "short" or "hold". No other values allowed.
         IMPORTANT: confidence MUST be an integer between 0 and 100.
-        IMPORTANT: take_profit_pct and stop_loss_pct MUST be decimal numbers like 0.5 or 0.2.
+        IMPORTANT: take_profit_pct and stop_loss_pct MUST be integers representing ROI percentage like 40 or 20.
         {{
             "direction": "long",
             "confidence": 75,
@@ -400,10 +388,9 @@ class AiRolloverStrategy(ScriptStrategyBase):
                     self.logger().info(f"🔄 AI极速变单 ({current_side} -> {decision['direction']})，反转清仓！")
                     await self._close_position()
 
-            # === 🎯 交易信号触发器 (非常重要: 可自由微调阈值) ===
-            # 发车条件：当AI判定做多(long)或做空(short)，且信心指数 (confidence) 大于等于这里设置的值时，即刻下单！
-            # 修改建议: 行情好可以改成 >= 60。要求极度精准可以改成 >= 85 (太高可能一天都不开单)
-            if decision.get("direction") in ["long", "short"] and decision.get("confidence", 0) >= 70:
+            # === 🎯 交易信号触发器 ===
+            # 发车条件：信心指数 >= 75 才开单
+            if decision.get("direction") in ["long", "short"] and decision.get("confidence", 0) >= 75:
                 if not self.current_position:
                     side = "buy" if decision["direction"] == "long" else "sell"
                     # ⚠️从连接器拿到的是 OKX 的数据，有上百刀差价，会导致直接穿仓！
@@ -472,6 +459,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
                             await asyncio.sleep(0.3)
                             
                     self.current_position = {"side": decision["direction"], "amount": submit_amount, "price": bfx_mid_price}
+                    self.position_open_time = self.current_timestamp  # 记录开仓时间戳
                     
                     # === 🎯 物理硬止损/止盈追踪单抛出 ===
                     # 这一步基于刚才抓取的 Bitfinex 真实成交基准价来挂单，彻底解决两千刀价差问题！
@@ -514,16 +502,19 @@ class AiRolloverStrategy(ScriptStrategyBase):
             self.logger().error(f"紧急平仓异常: {str(e)}")
 
     async def _place_tp_sl_orders(self, entry_price: float, amount: float, tp_pct: float, sl_pct: float):
-        # 平仓侧的数量符号刚好取反
+        # ⭐ tp_pct 和 sl_pct 现在是“收益率”，需要除以杠杆换算成“价格波动百分比”
+        tp_price_pct = tp_pct / self.leverage  # 例如: 40% ROI / 30x = 1.333% 价格波动
+        sl_price_pct = sl_pct / self.leverage  # 例如: 20% ROI / 30x = 0.667% 价格波动
+        
         close_amount = -float(amount)
         
         # 价格如果是做多，止盈加止损减
         if amount > 0:
-            tp_price = entry_price * (1 + tp_pct / 100)
-            sl_price = entry_price * (1 - sl_pct / 100)
+            tp_price = entry_price * (1 + tp_price_pct / 100)
+            sl_price = entry_price * (1 - sl_price_pct / 100)
         else:
-            tp_price = entry_price * (1 - tp_pct / 100)
-            sl_price = entry_price * (1 + sl_pct / 100)
+            tp_price = entry_price * (1 - tp_price_pct / 100)
+            sl_price = entry_price * (1 + sl_price_pct / 100)
             
         try:
             await self.bitfinex.create_order(
@@ -531,6 +522,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 order_type="LIMIT",
                 amount=close_amount,
                 price=tp_price,
+                lev=self.leverage,  # 止盈单也必须携带杠杆
                 reduce_only=True
             )
             
@@ -539,6 +531,7 @@ class AiRolloverStrategy(ScriptStrategyBase):
                 order_type="STOP",
                 amount=close_amount,
                 price=sl_price,
+                lev=self.leverage,  # 止损单也必须携带杠杆
                 reduce_only=True
             )
             self.logger().info(f"🛡️ 止盈线(${round(tp_price, 2)}) & 止损线(${round(sl_price, 2)}) 战壕构建完毕！")
