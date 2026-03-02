@@ -85,7 +85,7 @@ class BitfinexAPI:
             "amount": amount_str,
         }
         if price:
-            req["price"] = "{:.2f}".format(float(price))
+            req["price"] = "{:.1f}".format(float(price))
         if lev is not None:
             req["lev"] = int(lev)
         
@@ -223,13 +223,13 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         self.logger().info(f"📏 超密撒网: 本金={current_equity:.2f}u, 间距={self.grid_spacing_pct}%, 止盈={self.take_profit_pct}%")
         
         for level in range(1, self.grid_levels + 1):
-            buy_p = round(center_price * (1 - level * spacing), 2)
+            buy_p = round(center_price * (1 - level * spacing), 1)
             if buy_p >= self.lower_bound:
                 amt = round(level_notional / buy_p, 4)
                 res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt, buy_p, lev=self.leverage)
                 self._track_order(res, buy_p, "buy", amt, is_tp=False)
             
-            sell_p = round(center_price * (1 + level * spacing), 2)
+            sell_p = round(center_price * (1 + level * spacing), 1)
             if sell_p <= self.upper_bound:
                 amt = round(level_notional / sell_p, 4)
                 res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -amt, sell_p, lev=self.leverage)
@@ -271,10 +271,10 @@ class 一天量化2026_3_2(ScriptStrategyBase):
 
     async def _place_tp_and_sl(self, side, price, amount):
         tp_m = (1 + self.take_profit_pct/100) if side == "buy" else (1 - self.take_profit_pct/100)
-        tp_p = round(price * tp_m, 2)
+        tp_p = round(price * tp_m, 1)
         sl_v = (self.stop_loss_margin_pct / self.leverage) / 100
         sl_m = (1 - sl_v) if side == "buy" else (1 + sl_v)
-        sl_p = round(price * sl_m, 2)
+        sl_p = round(price * sl_m, 1)
         
         amt_sign = -amount if side == "buy" else amount
         res_tp = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt_sign, tp_p, lev=self.leverage)
@@ -286,11 +286,11 @@ class 一天量化2026_3_2(ScriptStrategyBase):
          notional = (equity * self.leverage) / self.grid_levels
          new_amt = round(notional / price, 4)
          if side == "buy":
-             p = round(price * (1 + self.take_profit_pct/100), 2)
+             p = round(price * (1 + self.take_profit_pct/100), 1)
              res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -new_amt, p, lev=self.leverage)
              self._track_order(res, p, "sell", new_amt, is_tp=False)
          else:
-             p = round(price * (1 - self.take_profit_pct/100), 2)
+             p = round(price * (1 - self.take_profit_pct/100), 1)
              res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", new_amt, p, lev=self.leverage)
              self._track_order(res, p, "buy", new_amt, is_tp=False)
 
