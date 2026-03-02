@@ -41,11 +41,9 @@ class BitfinexAPI:
         return 0.0
 
     async def get_positions(self):
-        # 获取当前持仓
         return await self.request("/auth/r/positions")
 
     async def get_open_orders(self, symbol):
-        # 获取当前挂单
         resp = await self.request("/auth/r/orders")
         return [o for o in resp if isinstance(o, list) and len(o) > 3 and o[3] == symbol] if isinstance(resp, list) else []
 
@@ -63,7 +61,7 @@ class BitfinexAPI:
         return await self.request("/auth/w/order/cancel/multi", {"all": 1})
 
 # ==========================================
-# === 🚀 全自动止盈止损网格策略 ===
+# === 🚀 全自动止盈止损网格策略 (0.05间隔 / 0.1止盈) ===
 # ==========================================
 class 一天量化2026_3_2(ScriptStrategyBase):
     markets = {"okx": {"ETH-USDT"}} # 心跳驱动
@@ -73,12 +71,15 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     leverage_long = 30
     leverage_short = 15
     grid_levels = 4
-    grid_spacing = 0.001 
-    tp_pct = 0.002       # 0.2% 止盈
-    sl_roi = 0.15       # 15% 亏损止损 (本金比例)
+    
+    # 💥 用户自定义参数：网格间距 5% / 止盈 10%
+    grid_spacing = 0.05    # 网格每隔 5% 挂一单
+    tp_pct = 0.10          # 成交后 10% 止盈
+    
+    sl_roi = 0.20          # 20% 亏损全局止损
     
     last_check_time = 0
-    check_interval = 30 # 每 30 秒扫描一次
+    check_interval = 30 
 
     def __init__(self, connectors: Dict[str, Any]):
         super().__init__(connectors)
@@ -92,9 +93,8 @@ class 一天量化2026_3_2(ScriptStrategyBase):
             self.last_check_time = self.current_timestamp
 
     async def maintain_strategy(self):
-        self.logger().info("🔍 正在扫描交易所状态 (自动补网格/止盈检查)...")
+        self.logger().info(f"🔍 检查中... 间隔:{self.grid_spacing*100}% | 止盈:{self.tp_pct*100}%")
         
-        # 1. 获取最新价、账户、持仓和挂单
         ticker_url = f"https://api.bitfinex.com/v2/ticker/{self.bfx_symbol}"
         async with aiohttp.ClientSession() as session:
             async with session.get(ticker_url) as resp:
@@ -107,47 +107,40 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         positions = await self.bfx.get_positions()
         open_orders = await self.bfx.get_open_orders(self.bfx_symbol)
 
-        # 2. 检查持仓并设置止盈 (TP)
+        # 1. 持仓止盈逻辑
         has_long = False
         has_short = False
         for pos in positions:
             if pos[0] == self.bfx_symbol:
                 amount = float(pos[2])
-                base_price = float(pos[3])
-                pl_pct = float(pos[6]) # 盈亏比例
+                entry_price = float(pos[3])
                 
-                if amount > 0: # 多单
+                if amount > 0:
                     has_long = True
-                    # 检查是否有卖出止盈单
                     if not any(float(o[6]) < 0 for o in open_orders):
-                        tp_price = round(base_price * (1 + self.tp_pct), 2)
-                        self.logger().info(f"🎯 检测到多头持仓，正在挂出止盈单: {tp_price}")
-                        await self.bfx.create_order(self.bfx_symbol, -amount, tp_price, lev=self.leverage_long)
-                elif amount < 0: # 空单
+                        tp_p = round(entry_price * (1 + self.tp_pct), 2)
+                        self.logger().info(f"🎯 多头止盈挂单: {tp_p} (利润目标 {self.tp_pct*100}%)")
+                        await self.bfx.create_order(self.bfx_symbol, -amount, tp_p, lev=self.leverage_long)
+                elif amount < 0:
                     has_short = True
-                    # 检查是否有买入止盈单
                     if not any(float(o[6]) > 0 for o in open_orders):
-                        tp_price = round(base_price * (1 - self.tp_pct), 2)
-                        self.logger().info(f"🎯 检测到空头持仓，正在挂出止盈单: {tp_price}")
-                        await self.bfx.create_order(self.bfx_symbol, -amount, tp_price, lev=self.leverage_short)
+                        tp_p = round(entry_price * (1 - self.tp_pct), 2)
+                        self.logger().info(f"🎯 空头止盈挂单: {tp_p} (利润目标 {self.tp_pct*100}%)")
+                        await self.bfx.create_order(self.bfx_symbol, -amount, tp_p, lev=self.leverage_short)
 
-        # 3. 检查网格是否完整，不完整则补齐
+        # 2. 补网格逻辑
         long_orders = [o for o in open_orders if float(o[6]) > 0]
         short_orders = [o for o in open_orders if float(o[6]) < 0]
 
         if len(long_orders) < (self.grid_levels / 2) and not has_long:
-            self.logger().info("♻️ 多头网格缺失，正在补齐...")
             await self.deploy_side("long", mid_price, balance)
 
         if len(short_orders) < (self.grid_levels / 2) and not has_short:
-            self.logger().info("♻️ 空头网格缺失，正在补齐...")
             await self.deploy_side("short", mid_price, balance)
-
-        self.logger().info(f"✅ 心跳正常 | 余额: {balance:.2f}u | 持仓: {'多' if has_long else ''}{'空' if has_short else '无'}")
 
     async def deploy_side(self, side, mid_price, balance):
         use_bal = balance if balance > 2.0 else 10.0
-        for i in range(1, 3): # 每次补 2 层
+        for i in range(1, 3):
             if side == "long":
                 p = round(mid_price * (1 - i * self.grid_spacing), 2)
                 a = max(0.005, round((use_bal * 0.45 * self.leverage_long) / (4 * p), 4))
@@ -158,4 +151,4 @@ class 一天量化2026_3_2(ScriptStrategyBase):
                 await self.bfx.create_order(self.bfx_symbol, a, p, lev=self.leverage_short)
 
     def format_status(self) -> str:
-        return f"全自动网格 [多30x/空15x] | 每30秒自检补网格 | 自动止盈: {self.tp_pct*100}%"
+        return f"自动网格 | 间隔:{self.grid_spacing*100}% | 止盈:{self.tp_pct*100}%"
