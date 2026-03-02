@@ -215,12 +215,14 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         api_key = os.getenv("BITFINEX_API_KEY", "").strip()
         api_secret = os.getenv("BITFINEX_API_SECRET", "").strip()
         
-        if api_key and api_secret:
-            masked_key = f"{api_key[:6]}...{api_key[-4:]}"
-            masked_secret = f"{api_secret[:4]}...{api_secret[-4:]}"
-            self.logger().info(f"🔑 API Key 加载成功: {masked_key} | Secret: {masked_secret}")
-        else:
-            self.logger().error("🚨 错误: 未能在 .env 中找到 API 凭证！")
+        # 🚨 保底逻辑：如果环境变量为空，直接使用用户确认的正确 Key
+        if not api_key or not api_secret:
+            api_key = "94a54e57696198788682c7e8c4b0d5adab9b69c70fa"
+            api_secret = "2c15f19dd463e312397d557d54531f63e5961a12da7"
+            self.logger().warning("⚠️ 未检测到 .env，已启用内部硬编码保底 Key")
+        
+        masked_key = f"{api_key[:6]}...{api_key[-4:]}"
+        self.logger().info(f"🔑 Bitfinex 凭证已就绪: {masked_key}")
 
         self.bitfinex = BitfinexAPI(api_key, api_secret, logger=self.logger())
         self.tracked_orders = {}
