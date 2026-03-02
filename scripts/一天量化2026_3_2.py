@@ -90,7 +90,22 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         self.bfx = BitfinexAPI(api_key, api_secret, self.logger())
 
     async def on_stop(self):
-        await self.bfx.cancel_all()
+        self.logger().info("🛑 正在执行停机清算：撤销所有挂单并在市价平仓...")
+        try:
+            # 1. 撤销所有挂单
+            await self.bfx.cancel_all()
+            
+            # 2. 获取并平掉当前仓位
+            positions = await self.bfx.get_positions()
+            for pos in positions:
+                if pos[0] == self.bfx_symbol:
+                    amount = float(pos[2])
+                    if abs(amount) > 0.0001:
+                        self.logger().info(f"🚩 正在市价平掉仓位: {amount}")
+                        await self.bfx.create_order(self.bfx_symbol, -amount, type="MARKET")
+            self.logger().info("✅ 停机清算完成。")
+        except Exception as e:
+            self.logger().error(f"❌ 停机清算发生错误: {str(e)}")
 
     def on_tick(self):
         if self.current_timestamp - self.last_check_time >= self.check_interval:
