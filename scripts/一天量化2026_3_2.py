@@ -133,8 +133,8 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     """
     🚀 一天量化2026_3_2 - Bitfinex ETH 极致超高频网格
     """
-    # 使用 paper_trade 避免由于 Binance API 未配置导致的启动失败
-    markets = {"paper_trade": {"ETH-USDT"}}  
+    # 使用你已经在 Hummingbot 中连接好的 Bitfinex 交易所作为占位符
+    markets = {"bitfinex": {"ETH-UST"}}  
     
     # --- 策略配置 ---
     bfx_symbol = "tETHF0:USTF0"
