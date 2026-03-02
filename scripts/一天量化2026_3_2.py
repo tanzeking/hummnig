@@ -32,13 +32,12 @@ class BitfinexAPI:
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
         
-        # 强制延迟，确保 Nonce 严格递增
-        await asyncio.sleep(0.15)
-        nonce = str(int(time.time() * 1000000))
+        # 强制延迟，确保 Nonce 严格递增且不撞车
+        await asyncio.sleep(0.1)
+        nonce = str(int(time.time() * 1000)) # 官方最推荐的 13 位毫秒 Nonce
         
-        # 手动构建紧凑 JSON 字符串，确保字段顺序和签名完全一致
+        # 使用紧凑型 JSON (separators 重要)，且保持传入字典的 key 顺序
         if payload_dict:
-            # OrderedDict 配合特定的 separators 确保 100% 紧凑
             body = json.dumps(payload_dict, separators=(',', ':'))
         else:
             body = "{}"
@@ -55,6 +54,8 @@ class BitfinexAPI:
         
         async with aiohttp.ClientSession() as session:
             try:
+                # 再次物理间隔保护
+                await asyncio.sleep(0.05)
                 async with session.post(url, headers=headers, data=body) as resp:
                     text = await resp.text()
                     try:
@@ -91,45 +92,44 @@ class BitfinexAPI:
 
     async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
         try:
-            amt_val = float(amount)
-            price_val = float(price) if price else 0.0
-            
-            # 价格熔断保护：对于 ETH，如果价格算出来大于 5000 或者小于 500，绝对是逻辑出错了
-            if price_val > 5000 or (price_val < 500 and price_val > 0):
-                self.logger.error(f"⚠️ 价格异常拦截: {price_val}，请检查网格计算逻辑！")
-                return {"error": True, "msg": "PRICE_OUT_OF_RANGE"}
-
-            # 严格按照 Bitfinex 官方要求的字典顺序构建 OrderedDict
+            # 1. 严格字段排序 (OrderedDict)
             req = OrderedDict()
             req["type"] = order_type.upper()
             req["symbol"] = symbol
-            req["amount"] = "{:.5f}".format(amt_val)
-            if price_val > 0:
-                req["price"] = "{:.1f}".format(price_val)
+            req["amount"] = "{:.5f}".format(float(amount)) # 数量必须是字符串
+            
+            if price and float(price) > 0:
+                price_val = float(price)
+                if price_val > 8000: # ETH 熔断保护
+                    return {"error": True, "msg": "PRICE_ABNORMAL"}
+                req["price"] = "{:.1f}".format(price_val) # 价格必须是字符串且1位小数
+            
             if lev:
-                req["lev"] = int(lev)
+                req["lev"] = int(lev) # 杠杆必须是整数 (JSON Number)
             if reduce_only:
-                req["flags"] = 1024
+                req["flags"] = 1024 # 标志必须是整数 (JSON Number)
 
             resp = await self.request("/auth/w/order/submit", req)
             
             is_success = False
-            err_msg = ""
+            msg = "未知错误"
+            
             if isinstance(resp, list) and len(resp) > 0 and resp[0] != "error":
                 is_success = True
             else:
-                err_msg = resp.get("msg", str(resp)) if isinstance(resp, dict) else str(resp)
+                # 详细捕获错误原因
+                msg = resp.get("msg", str(resp)) if isinstance(resp, dict) else str(resp)
 
             if self.logger:
-                side = "🟢 买入" if amt_val > 0 else "🔴 卖出"
-                p_disp = "{:.1f}".format(price_val) if price_val > 0 else "市价"
+                side = "🟢 买入" if float(amount) > 0 else "🔴 卖出"
+                p_disp = req.get("price", "市价")
                 if is_success:
-                    self.logger.info(f"{side} 成功 | 价格: {p_disp} | 数量: {abs(amt_val):.4f}")
+                    self.logger.info(f"{side} 已申报 | 价格: {p_disp} | 数量: {req['amount']}")
                 else:
-                    self.logger.error(f"❌ 下单失败 | 价格: {p_disp} | 原因: {err_msg}")
+                    self.logger.error(f"❌ 下单失败 | 价格: {p_disp} | 原因: {msg}")
             return resp
         except Exception as e:
-            if self.logger: self.logger.error(f"下单代码崩溃: {e}")
+            if self.logger: self.logger.error(f"下单模块异常: {e}")
             return {"error": True, "msg": str(e)}
 
     async def fetch_open_orders(self, symbol: str) -> list:
