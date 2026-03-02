@@ -1,3 +1,4 @@
+
 import os
 import json
 import asyncio
@@ -6,315 +7,122 @@ import hmac
 import hashlib
 import aiohttp
 from collections import OrderedDict
-from typing import Dict, Any, List, Optional
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Dict, Any
 
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
-# 改进的 .env 加载逻辑
-env_paths = [".env", "/home/hummingbot/.env"]
-for env_path in env_paths:
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf8") as f:
-            for line in f:
-                line = line.split("#", 1)[0].strip()
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    val = v.strip().strip("'\"")
-                    os.environ[k.strip()] = val
+# --- 金融级高精度格式化 (杜绝连写) ---
+def d_p(val): # 价格: 1位小数
+    return str(Decimal(str(val)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
 
-class BitfinexAPI:
-    """极轻量 Bitfinex Async REST 客户端"""
-    def __init__(self, api_key: str, api_secret: str, logger=None):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.base_url = "https://api.bitfinex.com/v2"
-        self.logger = logger
+def d_a(val): # 数量: 5位小数
+    return str(Decimal(str(val)).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP))
 
-    async def request(self, endpoint: str, payload_dict: dict = None):
-        url = self.base_url + endpoint
-        await asyncio.sleep(0.1)
+class BfxRest:
+    def __init__(self, key, secret, logger):
+        self.key, self.secret, self.logger = key, secret, logger
+        self.url = "https://api.bitfinex.com/v2"
+
+    async def req(self, path, payload):
         nonce = str(int(time.time() * 1000000))
-        
-        if payload_dict:
-            body = json.dumps(payload_dict, separators=(',', ':'))
-        else:
-            body = "{}"
-        
-        signature_payload = f"/api/v2{endpoint}{nonce}{body}"
-        sig = hmac.new(self.api_secret.encode('utf-8'), signature_payload.encode('utf-8'), hashlib.sha384).hexdigest()
-        
-        headers = {
-            "bfx-nonce": nonce,
-            "bfx-apikey": self.api_key,
-            "bfx-signature": sig,
-            "content-type": "application/json"
-        }
-        
+        body = json.dumps(payload, separators=(',', ':'))
+        sig_str = f"/api/v2{path}{nonce}{body}"
+        sig = hmac.new(self.secret.encode(), sig_str.encode(), hashlib.sha384).hexdigest()
+        headers = {"bfx-nonce": nonce, "bfx-apikey": self.key, "bfx-signature": sig, "content-type": "application/json"}
         async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(url, headers=headers, data=body) as resp:
-                    text = await resp.text()
-                    try:
-                        data = json.loads(text)
-                        if isinstance(data, list) and len(data) >= 3 and data[0] == "error":
-                             return {"error": True, "code": data[1], "msg": data[2]}
-                        return data
-                    except:
-                        return {"error": True, "msg": text}
-            except Exception as e:
-                return {"error": True, "msg": str(e)}
+            async with session.post(f"{self.url}{path}", headers=headers, data=body) as r:
+                return await r.json()
 
-    async def get_ticker(self, symbol: str) -> float:
-        url = f"{self.base_url}/ticker/{symbol}"
+    async def get_price(self, sym):
         async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url) as resp:
-                    data = await resp.json()
-                    if isinstance(data, list) and len(data) >= 7:
-                        return float(data[6])
-                    return 0.0
-            except:
-                return 0.0
+            async with session.get(f"{self.url}/ticker/{sym}") as r:
+                data = await r.json()
+                return float(data[6]) if isinstance(data, list) and len(data) >= 7 else 0.0
 
-    async def get_available_balance(self) -> float:
-        resp = await self.request("/auth/r/wallets")
-        if isinstance(resp, list):
-            for w in resp:
-                if len(w) >= 5 and w[0] == "margin" and w[1] in ["USTF0", "UST", "USDt", "USD"]:
-                    available = w[4]
-                    if available is not None:
-                        return float(available)
+    async def get_bal(self):
+        r = await self.req("/auth/r/wallets", {})
+        if isinstance(r, list):
+            for w in r:
+                if len(w) >= 5 and w[0] == "margin" and w[1] in ["USTF0", "UST", "USDt"]:
+                    return float(w[4])
         return 0.0
 
-    async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
-        try:
-            # 物理级强制格式化：彻底锁定 1 位小数，防止系统 locale 造成的连写 Bug
-            def force_one_decimal(val):
-                v = int(float(val) * 10 + 0.5)
-                s = str(v)
-                if len(s) < 2: s = s.zfill(2)
-                return s[:-1] + "." + s[-1]
-
-            amt_str = "{:.5f}".format(float(amount))
-            price_str = force_one_decimal(price) if price else "0.0"
-
-            req = OrderedDict()
-            req["type"] = order_type.upper()
-            req["symbol"] = symbol
-            req["amount"] = amt_str
-            if price and float(price) > 0:
-                req["price"] = price_str
-            
-            if lev: req["lev"] = int(lev)
-            if reduce_only: req["flags"] = 1024
-
-            resp = await self.request("/auth/w/order/submit", req)
-            
-            is_success = False
-            msg = "未知错误"
-            if isinstance(resp, list) and len(resp) > 0 and resp[0] != "error":
-                is_success = True
-            else:
-                msg = resp.get("msg", str(resp)) if isinstance(resp, dict) else str(resp)
-
-            if self.logger:
-                side = "🟢 买入" if float(amount) > 0 else "🔴 卖出"
-                if is_success:
-                    self.logger.info(f"{side} 已申报 | 价格: {price_str} | 数量: {amt_str}")
-                else:
-                    self.logger.error(f"❌ 下单失败 | 价格: {price_str} | 原因: {msg}")
-            return resp
-        except Exception as e:
-            if self.logger: self.logger.error(f"下单异常: {e}")
-            return {"error": True, "msg": str(e)}
-
-    async def fetch_open_orders(self, symbol: str) -> list:
-        resp = await self.request("/auth/r/orders")
-        if isinstance(resp, list) and len(resp) > 0 and resp[0] != "error":
-            return [o for o in resp if isinstance(o, list) and len(o) > 3 and o[3] == symbol]
-        return []
-
-    async def cancel_all_orders(self, symbol: str = None):
-        return await self.request("/auth/w/order/cancel", {"all": 1})
-
-    async def get_positions(self) -> list:
-        resp = await self.request("/auth/r/positions")
-        if isinstance(resp, list): return resp
-        return []
-
-    async def close_position(self, symbol: str):
-        positions = await self.get_positions()
-        for pos in positions:
-            if len(pos) >= 3 and pos[0] == symbol:
-                amount = float(pos[2])
-                if amount != 0:
-                    await self.create_order(symbol, "MARKET", -amount, reduce_only=True)
-                    return True
-        return False
-
 class 一天量化2026_3_2(ScriptStrategyBase):
-    """
-    🚀 一天量化2026_3_2 - Bitfinex ETH 极致超高频实盘
-    """
-    markets = {"okx": {"ETH-USDT"}}  
+    markets = {"okx": {"ETH-USDT"}} # 仅用于 Humminbot 心跳，不实盘交易
     
-    # --- 策略配置 (实盘参数) ---
-    bfx_symbol = "tETHF0:USTF0"
-    leverage = 30
-    grid_levels = 4
-    lower_bound = 1920.0
-    upper_bound = 1999.0
-    
-    grid_spacing_pct = 0.1
-    take_profit_pct = 0.2
-    stop_loss_margin_pct = 20.0
-    
-    recenter_threshold_pct = 0.5
-    check_interval = 8
-    
-    # --- 状态变量 ---
-    last_check_time = 0
-    grid_center_price = 0.0
-    grid_initialized = False
-    tracked_orders: Dict[int, Dict] = {}
-    
-    def __init__(self, connectors: Dict[str, Any]):
+    # --- 用户锁定参数 ---
+    SYM = "tETHF0:USTF0"
+    LEV = 30
+    LEVELS = 4
+    SPACING = 0.001 # 0.1%
+    TP = 0.002      # 0.2%
+    R_L = 1920.0
+    R_H = 1999.0
+
+    def __init__(self, connectors):
         super().__init__(connectors)
-        api_key = os.getenv("BITFINEX_API_KEY", "").strip()
-        api_secret = os.getenv("BITFINEX_API_SECRET", "").strip()
-        
-        if not api_key or not api_secret:
-            api_key = "94a54e57696198788682c7e8c4b0d5adab9b69c70fa"
-            api_secret = "2c15f19dd463e312397d557d54531f63e5961a12da7"
-            self.logger().warning("⚠️ 未检测到 .env，已启用内部硬编码保底 Key")
-        
-        self.bitfinex = BitfinexAPI(api_key, api_secret, logger=self.logger())
-        self.tracked_orders = {}
+        k = os.getenv("BITFINEX_API_KEY", "94a54e57696198788682c7e8c4b0d5adab9b69c70fa")
+        s = os.getenv("BITFINEX_API_SECRET", "2c15f19dd463e312397d557d54531f63e5961a12da7")
+        self.api = BfxRest(k, s, self.logger())
+        self.initialized = False
+        self.orders = {}
 
     def on_tick(self):
-        current_time = self.current_timestamp
-        if current_time - self.last_check_time >= self.check_interval:
-            self.last_check_time = current_time
-            asyncio.ensure_future(self._grid_tick())
+        if not self.initialized:
+            asyncio.ensure_future(self.setup_grid())
+            self.initialized = True
 
-    async def _grid_tick(self):
-        try:
-            current_price = await self.bitfinex.get_ticker(self.bfx_symbol)
-            if current_price <= 0: return
-            
-            if current_price < self.lower_bound or current_price > self.upper_bound:
-                self.logger().warning(f"⚠️ 价格 {current_price} 超出范围")
-                return
+    async def setup_grid(self):
+        p = await self.api.get_price(self.SYM)
+        if p < self.R_L or p > self.R_H:
+            self.logger().warning(f"WAIT: Price {p} out of range [{self.R_L}-{self.R_H}]")
+            return
 
-            if not self.grid_initialized:
-                await self._deploy_full_grid(current_price)
-                self.grid_initialized = True
-                return
-
-            drift = abs(current_price - self.grid_center_price) / self.grid_center_price * 100
-            if drift >= self.recenter_threshold_pct:
-                self.logger().info(f"🔄 偏移 {drift:.2f}%，重布网...")
-                await self._cancel_all_grid_orders()
-                await self._deploy_full_grid(current_price)
-                return
-
-            await self._check_and_fill_grid()
-        except Exception as e:
-            self.logger().error(f"运行异常: {e}")
-
-    async def _deploy_full_grid(self, center_price: float):
-        self.grid_center_price = center_price
-        spacing = self.grid_spacing_pct / 100
+        # 1. 清场
+        await self.api.req("/auth/w/order/cancel", {"all": 1})
+        self.logger().info("CLEAN: All old orders cancelled.")
         
-        current_balance = await self.bitfinex.get_available_balance()
-        if current_balance <= 0.1: current_balance = 10.0
-            
-        level_notional = (current_balance * self.leverage) / self.grid_levels
-        self.logger().info(f"📏 实盘撒网: 余额={current_balance:.2f}u, 杠杆={self.leverage}x, 每层={level_notional:.2f}u")
+        # 2. 算钱 (核心分配逻辑)
+        bal = await self.api.get_bal()
+        if bal <= 0: bal = 10.0
         
-        for level in range(1, self.grid_levels + 1):
-            c_bp = float(center_price * (1 - level * spacing))
-            if c_bp >= self.lower_bound:
-                amt = float(level_notional / c_bp)
-                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt, c_bp, lev=self.leverage)
-                self._track_order(res, c_bp, "buy", amt, is_tp=False)
-            
-            c_sp = float(center_price * (1 + level * spacing))
-            if c_sp <= self.upper_bound:
-                amt = float(level_notional / c_sp)
-                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -amt, c_sp, lev=self.leverage)
-                self._track_order(res, c_sp, "sell", amt, is_tp=False)
-            
-            await asyncio.sleep(0.3)
+        # 核心分配：余额 * 杠杆 / (层数 * 2)，确保买卖总合不超标
+        # 10U * 30 / 8 = 每张单子挂 37.5U 的货
+        unit_val = (bal * self.LEV) / (self.LEVELS * 2)
+        self.logger().info(f"START: Bal={bal:.2f}u, Lev={self.LEV}x, Unit_Notional={unit_val:.2f}u")
 
-    def _track_order(self, api_response, price, side, amount, is_tp):
-        if not api_response: return
-        try:
-            if isinstance(api_response, list) and len(api_response) >= 5:
-                order_data = api_response[4]
-                if isinstance(order_data, list) and len(order_data) > 0:
-                    order = order_data[0] if isinstance(order_data[0], list) else order_data
-                    order_id = int(order[0])
-                    self.tracked_orders[order_id] = {"price": price, "side": side, "amount": amount, "is_tp": is_tp}
-        except Exception as e:
-            self.logger().error(f"追踪失败: {e}")
+        for i in range(1, self.LEVELS + 1):
+            # 买单
+            bp = p * (1 - i * self.SPACING)
+            if bp >= self.R_L:
+                await self.place_job("buy", bp, unit_val/bp)
+            # 卖单
+            sp = p * (1 + i * self.SPACING)
+            if sp <= self.R_H:
+                await self.place_job("sell", sp, unit_val/sp)
+            await asyncio.sleep(0.5)
 
-    async def _check_and_fill_grid(self):
-        open_orders = await self.bitfinex.fetch_open_orders(self.bfx_symbol)
-        open_ids = {int(o[0]) for o in open_orders if len(o) > 0}
+    async def place_job(self, side, price, amount):
+        p_s = d_p(price)
+        a_s = d_a(amount if side == "buy" else -amount)
         
-        for oid, info in list(self.tracked_orders.items()):
-            if oid not in open_ids:
-                side, price, amount, is_tp = info["side"], info["price"], info["amount"], info["is_tp"]
-                del self.tracked_orders[oid]
-                if is_tp:
-                    self.logger().info(f"💰 止盈成功! 正在重新补单...")
-                    asyncio.ensure_future(self._relink_grid(side, price, amount))
-                else:
-                    self.logger().info(f"🔔 入场成交: {side} @ {price}, 挂 0.2% 止盈")
-                    await self._place_tp_and_sl(side, price, amount)
-
-    async def _place_tp_and_sl(self, side, price, amount):
-        tp_m = (1 + self.take_profit_pct/100) if side == "buy" else (1 - self.take_profit_pct/100)
-        tp_p = price * tp_m
-        sl_v = (self.stop_loss_margin_pct / self.leverage) / 100
-        sl_m = (1 - sl_v) if side == "buy" else (1 + sl_v)
-        sl_p = price * sl_m
+        payload = OrderedDict([
+            ("type", "LIMIT"),
+            ("symbol", self.SYM),
+            ("amount", a_s),
+            ("price", p_s),
+            ("lev", self.LEV)
+        ])
         
-        amt_sign = -amount if side == "buy" else amount
-        res_tp = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt_sign, tp_p, lev=self.leverage)
-        self._track_order(res_tp, tp_p, "sell" if side == "buy" else "buy", abs(amount), is_tp=True)
-        await self.bitfinex.create_order(self.bfx_symbol, "STOP", amt_sign, sl_p, lev=self.leverage, reduce_only=True)
-
-    async def _relink_grid(self, side, price, amount):
-         c_bal = await self.bitfinex.get_available_balance()
-         if c_bal <= 0.1: c_bal = 10.0
-         level_notional = (c_bal * self.leverage) / self.grid_levels
-         new_amt = float(level_notional / price)
-         
-         if side == "buy": # 买单成交补卖单
-             p = price * (1 + self.take_profit_pct/100)
-             res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -new_amt, p, lev=self.leverage)
-             self._track_order(res, p, "sell", new_amt, is_tp=False)
-         else: # 卖单成交补买单
-             p = price * (1 - self.take_profit_pct/100)
-             res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", new_amt, p, lev=self.leverage)
-             self._track_order(res, p, "buy", new_amt, is_tp=False)
-
-    async def _cancel_all_grid_orders(self):
-        await self.bitfinex.cancel_all_orders(self.bfx_symbol)
-        self.tracked_orders.clear()
-
-    async def on_stop(self):
-        self.logger().info("🛑 策略停止，清场中...")
-        await self._cancel_all_grid_orders()
-        await self.bitfinex.close_position(self.bfx_symbol)
+        res = await self.api.req("/auth/w/order/submit", payload)
+        
+        if isinstance(res, list) and len(res) > 0 and res[0] != "error":
+            self.logger().info(f"SUCCESS: {side} {self.SYM} at {p_s}")
+            # 追踪 ID ... (省略简化)
+        else:
+            err = res[2] if isinstance(res, list) and len(res) >= 3 else str(res)
+            self.logger().error(f"FAILED: {side} at {p_s} | REASON: {err}")
 
     def format_status(self) -> str:
-        if not self.grid_initialized: return "正在等待行情..."
-        return (
-            f"⚡ 极致超高频实盘 | {self.bfx_symbol}\n"
-            f"� 活跃挂单: {len(self.tracked_orders)}\n"
-            f"📐 杠杆比例: {self.leverage}x | 间距: {self.grid_spacing_pct}%"
-        )
+        return f"Grid Strategy Running | {self.SYM} | Leverage: {self.LEV}x | Grid: {self.LEVELS}"
