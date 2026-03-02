@@ -31,13 +31,11 @@ class BitfinexAPI:
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
         
-        # 使用毫秒级时间戳作为 Nonce，这是最稳健的方式
-        nonce = str(int(time.time() * 1000))
+        # 使用纳秒级时间戳，确保即便毫秒内并发，Nonce也严格递增
+        nonce = str(time.time_ns())
         
-        # 核心：必须确保签名用的字符串和发送的字符串完全一致
-        # 处理空 Body 的情况，Bitfinex 要求空 Body 时签名使用原文
+        # 核心：必须使用无空格的紧凑JSON，否则签名校验(Digest)必失败
         if payload_dict:
-            # 使用 separators 确保没有额外空格
             body = json.dumps(payload_dict, separators=(',', ':'))
         else:
             body = "{}"
@@ -54,17 +52,16 @@ class BitfinexAPI:
         
         async with aiohttp.ClientSession() as session:
             try:
-                # 强制间隔，防止 Nonce 碰撞
-                await asyncio.sleep(0.12)
+                # 增加极小的排队延迟，保护 Nonce 顺序
+                await asyncio.sleep(0.08)
                 async with session.post(url, headers=headers, data=body) as resp:
                     text = await resp.text()
                     try:
-                        data = json.loads(text)
+                        return json.loads(text)
                     except:
-                        data = {"error": "JSON_PARSE_FAILED", "text": text}
-                    return data
+                        return text
             except Exception as e:
-                return {"error": "REQUEST_EXCEPTION", "msg": str(e)}
+                return {"error": str(e)}
 
     async def get_ticker(self, symbol: str) -> float:
         url = f"{self.base_url}/ticker/{symbol}"
@@ -89,44 +86,46 @@ class BitfinexAPI:
         return 0.0
 
     async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
-        # 极其严格的价格与数量格式化
-        amount_str = "{:.5f}".format(float(amount))
+        # 极其严格的数据转换：确保点位和精度不出错
+        amt_val = float(amount)
+        amt_str = "{:.5f}".format(amt_val)
         
         req = {
             "type": order_type.upper(),
             "symbol": symbol,
-            "amount": amount_str,
+            "amount": amt_str,
         }
         if price:
-            # 价格保留 1 位小数，这在 ETH 永续中是强制的
-            req["price"] = "{:.1f}".format(float(price))
+            # 价格保留 1 位小数，严禁使用 round()，防止浮点数毛刺
+            price_val = float(price)
+            req["price"] = "{:.1f}".format(price_val)
+        
         if lev is not None:
             req["lev"] = int(lev)
-        
         if reduce_only:
             req["flags"] = 1024
 
         resp = await self.request("/auth/w/order/submit", req)
         
+        # 严谨的错误侦测逻辑
         is_success = False
-        error_msg = ""
+        error_info = "未知错误"
         
-        # 解析 Bitfinex 复杂的嵌套返回
         if isinstance(resp, list):
             if len(resp) > 0 and resp[0] != "error":
                 is_success = True
-            else:
-                error_msg = str(resp[2]) if len(resp) >= 3 else str(resp)
-        else:
-            error_msg = resp.get("error", str(resp)) if isinstance(resp, dict) else str(resp)
+            elif len(resp) >= 3:
+                error_info = f"{resp[2]}"
+        elif isinstance(resp, dict):
+            error_info = resp.get("message", resp.get("error", str(resp)))
         
         if self.logger:
-            side_str = "买入" if float(amount) > 0 else "卖出"
-            p_str = "{:.1f}".format(price) if price else "市价"
+            side_str = "🟢 买入" if amt_val > 0 else "🔴 卖出"
+            p_display = "{:.1f}".format(float(price)) if price else "市价"
             if is_success:
-                self.logger.info(f"✅ [下单成功] {side_str} {abs(float(amount)):.4f} @ {p_str}")
+                self.logger.info(f"{side_str} 成功 | 价格: {p_display} | 数量: {abs(amt_val):.4f}")
             else:
-                self.logger.error(f"❌ [下单失败] {side_str} @ {p_str} | 原因: {error_msg}")
+                self.logger.error(f"❌ 下单失败 | 价格: {p_display} | 原因: {error_info}")
         return resp
 
     async def fetch_open_orders(self, symbol: str) -> list:
