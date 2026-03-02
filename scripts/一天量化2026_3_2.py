@@ -133,8 +133,8 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     """
     🚀 一天量化2026_3_2 - Bitfinex ETH 极致超高频网格
     """
-    # 使用你已经在 Hummingbot 中连接好的 Bitfinex 交易所作为占位符
-    markets = {"bitfinex": {"ETH-UST"}}  
+    # 使用 okx 作为心跳连接器（不实际交易），绕过 bitfinex 未连接报错
+    markets = {"okx": {"ETH-USDT"}}  
     
     # --- 策略配置 ---
     bfx_symbol = "tETHF0:USTF0"
