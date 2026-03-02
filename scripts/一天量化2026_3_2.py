@@ -11,22 +11,31 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     🚀 恢复版：Bitfinex ETH 永续网格
     回归原生下单逻辑，确保 10U 保证金 100% 成功。
     """
-    # 锁定交易对和连接器
-    exchange = "bitfinex_perpetual" # 确保您在 HB 中配置的是这个名称
+    # 动态识别连接器
+    connector_name = "bitfinex_perpetual" 
     trading_pair = "ETH-USTF0"
-    markets = {exchange: {trading_pair}}
+    markets = {connector_name: {trading_pair}}
 
-    # --- 核心网格配置 ---
+    # --- 核心网格参数 ---
     leverage = 30
     grid_levels = 4
-    grid_spacing = 0.001 # 0.1%
-    tp_pct = 0.002       # 0.2%
-    
+    grid_spacing = 0.001 
+    tp_pct = 0.002       
     lower_bound = 1920.0
     upper_bound = 1999.0
-
-    # 状态变量
     initialized = False
+
+    def __init__(self, connectors: Dict[str, Any]):
+        # 自动扫描已连接的交易所名称
+        actual_name = self.connector_name
+        for name in connectors.keys():
+            if "bitfinex" in name:
+                actual_name = name
+                break
+        # 动态替换市场配置
+        self.markets = {actual_name: {self.trading_pair}}
+        self.exchange = actual_name
+        super().__init__(connectors)
     
     def on_tick(self):
         if not self.initialized:
