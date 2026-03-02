@@ -2,7 +2,7 @@
 import os
 import decimal
 from decimal import Decimal
-from typing import Dict, List
+from typing import Any, Dict, List
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
