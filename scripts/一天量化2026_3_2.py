@@ -11,18 +11,17 @@ from decimal import Decimal
 
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
-# 改进的 .env 加载逻辑，支持行尾注释和多余空格
+# 改进的 .env 加载逻辑
 env_paths = [".env", "/home/hummingbot/.env"]
 for env_path in env_paths:
     if os.path.exists(env_path):
         with open(env_path, "r", encoding="utf8") as f:
             for line in f:
-                line = line.split("#", 1)[0].strip() # 剔除行尾注释
+                line = line.split("#", 1)[0].strip()
                 if "=" in line:
                     k, v = line.split("=", 1)
                     val = v.strip().strip("'\"")
                     os.environ[k.strip()] = val
-                    # 也可以尝试直接覆盖到 hummingbot 的配置中（如果需要）
 
 class BitfinexAPI:
     """极轻量 Bitfinex Async REST 客户端"""
@@ -34,8 +33,6 @@ class BitfinexAPI:
 
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
-        
-        # 强制微秒级 Nonce (16位)，彻底解决 nonce small 问题
         await asyncio.sleep(0.1)
         nonce = str(int(time.time() * 1000000))
         
@@ -92,12 +89,11 @@ class BitfinexAPI:
 
     async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
         try:
-            # 1. 物理级强制格式化：不依赖系统 locale
-            # 逻辑：取 float -> 乘 10 -> 转 int -> 转 string -> 插入小数点
-            # 这样 1945.8 绝对会变成 "1945.8"，1945.986 绝对会变成 "1946.0"
+            # 物理级强制格式化：彻底锁定 1 位小数，防止系统 locale 造成的连写 Bug
             def force_one_decimal(val):
                 v = int(float(val) * 10 + 0.5)
                 s = str(v)
+                if len(s) < 2: s = s.zfill(2)
                 return s[:-1] + "." + s[-1]
 
             amt_str = "{:.5f}".format(float(amount))
@@ -107,7 +103,7 @@ class BitfinexAPI:
             req["type"] = order_type.upper()
             req["symbol"] = symbol
             req["amount"] = amt_str
-            if float(price_val := (price or 0)) > 0:
+            if price and float(price) > 0:
                 req["price"] = price_str
             
             if lev: req["lev"] = int(lev)
@@ -123,9 +119,9 @@ class BitfinexAPI:
                 msg = resp.get("msg", str(resp)) if isinstance(resp, dict) else str(resp)
 
             if self.logger:
-                side = "🟢 买入" if amt_val > 0 else "🔴 卖出"
+                side = "🟢 买入" if float(amount) > 0 else "🔴 卖出"
                 if is_success:
-                    self.logger.info(f"{side} 已申报 | 价格: {price_str} | 数量: {amount_str}")
+                    self.logger.info(f"{side} 已申报 | 价格: {price_str} | 数量: {amt_str}")
                 else:
                     self.logger.error(f"❌ 下单失败 | 价格: {price_str} | 原因: {msg}")
             return resp
@@ -135,21 +131,16 @@ class BitfinexAPI:
 
     async def fetch_open_orders(self, symbol: str) -> list:
         resp = await self.request("/auth/r/orders")
-        # 必须先确保 resp 是列表，且不是报错列表
         if isinstance(resp, list) and len(resp) > 0 and resp[0] != "error":
             return [o for o in resp if isinstance(o, list) and len(o) > 3 and o[3] == symbol]
         return []
-
-    async def cancel_order(self, order_id: int):
-        return await self.request("/auth/w/order/cancel", {"id": int(order_id)})
 
     async def cancel_all_orders(self, symbol: str = None):
         return await self.request("/auth/w/order/cancel", {"all": 1})
 
     async def get_positions(self) -> list:
         resp = await self.request("/auth/r/positions")
-        if isinstance(resp, list):
-            return resp
+        if isinstance(resp, list): return resp
         return []
 
     async def close_position(self, symbol: str):
@@ -158,35 +149,29 @@ class BitfinexAPI:
             if len(pos) >= 3 and pos[0] == symbol:
                 amount = float(pos[2])
                 if amount != 0:
-                    if self.logger:
-                        self.logger.info(f"正在全清仓 {symbol}, 仓位大小: {amount}")
                     await self.create_order(symbol, "MARKET", -amount, reduce_only=True)
                     return True
         return False
 
 class 一天量化2026_3_2(ScriptStrategyBase):
     """
-    🚀 一天量化2026_3_2 - Bitfinex ETH 极致超高频网格
+    🚀 一天量化2026_3_2 - Bitfinex ETH 极致超高频实盘
     """
-    # 使用 okx 作为心跳连接器（不实际交易），绕过 bitfinex 未连接报错
     markets = {"okx": {"ETH-USDT"}}  
     
-    # --- 策略配置 ---
+    # --- 策略配置 (实盘参数) ---
     bfx_symbol = "tETHF0:USTF0"
-    initial_capital = 10.0
-    leverage = 30                 # 用户指定：30倍杠杆
-    grid_levels = 4               # 用户指定：4层网格
-    lower_bound = 1920.0          # 用户指定：1920下线
-    upper_bound = 1999.0          # 用户指定：1999上线
+    leverage = 30
+    grid_levels = 4
+    lower_bound = 1920.0
+    upper_bound = 1999.0
     
-    # ⚡ 超密网格设置
     grid_spacing_pct = 0.1
     take_profit_pct = 0.2
-    total_profit_target = 20.0
     stop_loss_margin_pct = 20.0
     
     recenter_threshold_pct = 0.5
-    check_interval = 8            # 8秒检查一次
+    check_interval = 8
     
     # --- 状态变量 ---
     last_check_time = 0
@@ -199,15 +184,11 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         api_key = os.getenv("BITFINEX_API_KEY", "").strip()
         api_secret = os.getenv("BITFINEX_API_SECRET", "").strip()
         
-        # 🚨 保底逻辑：如果环境变量为空，直接使用用户确认的正确 Key
         if not api_key or not api_secret:
             api_key = "94a54e57696198788682c7e8c4b0d5adab9b69c70fa"
             api_secret = "2c15f19dd463e312397d557d54531f63e5961a12da7"
             self.logger().warning("⚠️ 未检测到 .env，已启用内部硬编码保底 Key")
         
-        masked_key = f"{api_key[:6]}...{api_key[-4:]}"
-        self.logger().info(f"🔑 Bitfinex 凭证已就绪: {masked_key}")
-
         self.bitfinex = BitfinexAPI(api_key, api_secret, logger=self.logger())
         self.tracked_orders = {}
 
@@ -223,7 +204,7 @@ class 一天量化2026_3_2(ScriptStrategyBase):
             if current_price <= 0: return
             
             if current_price < self.lower_bound or current_price > self.upper_bound:
-                self.logger().warning(f"⚠️ 价格 {current_price} 超出范围，待机中")
+                self.logger().warning(f"⚠️ 价格 {current_price} 超出范围")
                 return
 
             if not self.grid_initialized:
@@ -233,7 +214,7 @@ class 一天量化2026_3_2(ScriptStrategyBase):
 
             drift = abs(current_price - self.grid_center_price) / self.grid_center_price * 100
             if drift >= self.recenter_threshold_pct:
-                self.logger().info(f"🔄 超高频对齐: 偏移 {drift:.2f}%，重布网...")
+                self.logger().info(f"🔄 偏移 {drift:.2f}%，重布网...")
                 await self._cancel_all_grid_orders()
                 await self._deploy_full_grid(current_price)
                 return
@@ -246,29 +227,24 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         self.grid_center_price = center_price
         spacing = self.grid_spacing_pct / 100
         
-        # 核心实盘逻辑：直接读取交易所钱包可用余额
         current_balance = await self.bitfinex.get_available_balance()
-        if current_balance <= 0.1: # 如果余额太低（小于0.1u），使用保底 10u 逻辑或报错
-            current_balance = 10.0
+        if current_balance <= 0.1: current_balance = 10.0
             
         level_notional = (current_balance * self.leverage) / self.grid_levels
-        
-        self.logger().info(f"📏 实盘撒网: 钱包余额={current_balance:.2f}u, 杠杆={self.leverage}x, 每层名义={level_notional:.2f}u")
+        self.logger().info(f"📏 实盘撒网: 余额={current_balance:.2f}u, 杠杆={self.leverage}x, 每层={level_notional:.2f}u")
         
         for level in range(1, self.grid_levels + 1):
-            # 显式重置变量，防止循环污染
-            current_bp = float(center_price * (1 - level * spacing))
-            if current_bp >= self.lower_bound:
-                amt = float(level_notional / current_bp)
-                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt, current_bp, lev=self.leverage)
-                self._track_order(res, current_bp, "buy", amt, is_tp=False)
+            c_bp = float(center_price * (1 - level * spacing))
+            if c_bp >= self.lower_bound:
+                amt = float(level_notional / c_bp)
+                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt, c_bp, lev=self.leverage)
+                self._track_order(res, c_bp, "buy", amt, is_tp=False)
             
-            # 卖单同样显式重置
-            current_sp = float(center_price * (1 + level * spacing))
-            if current_sp <= self.upper_bound:
-                amt = float(level_notional / current_sp)
-                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -amt, current_sp, lev=self.leverage)
-                self._track_order(res, current_sp, "sell", amt, is_tp=False)
+            c_sp = float(center_price * (1 + level * spacing))
+            if c_sp <= self.upper_bound:
+                amt = float(level_notional / c_sp)
+                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -amt, c_sp, lev=self.leverage)
+                self._track_order(res, c_sp, "sell", amt, is_tp=False)
             
             await asyncio.sleep(0.3)
 
@@ -288,20 +264,16 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         open_orders = await self.bitfinex.fetch_open_orders(self.bfx_symbol)
         open_ids = {int(o[0]) for o in open_orders if len(o) > 0}
         
-        filled_orders = []
         for oid, info in list(self.tracked_orders.items()):
             if oid not in open_ids:
-                filled_orders.append((oid, info))
+                side, price, amount, is_tp = info["side"], info["price"], info["amount"], info["is_tp"]
                 del self.tracked_orders[oid]
-        
-        for oid, info in filled_orders:
-            side, price, amount, is_tp = info["side"], info["price"], info["amount"], info["is_tp"]
-            if is_tp:
-                self.logger().info(f"💰 止盈成功! 申报补单...")
-                asyncio.ensure_future(self._relink_grid(side, price, amount))
-            else:
-                self.logger().info(f"🔔 入场成交: {side} @ {price}, 挂 0.2% 止盈 + 20% 止损")
-                await self._place_tp_and_sl(side, price, amount)
+                if is_tp:
+                    self.logger().info(f"💰 止盈成功! 正在重新补单...")
+                    asyncio.ensure_future(self._relink_grid(side, price, amount))
+                else:
+                    self.logger().info(f"🔔 入场成交: {side} @ {price}, 挂 0.2% 止盈")
+                    await self._place_tp_and_sl(side, price, amount)
 
     async def _place_tp_and_sl(self, side, price, amount):
         tp_m = (1 + self.take_profit_pct/100) if side == "buy" else (1 - self.take_profit_pct/100)
@@ -311,24 +283,21 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         sl_p = price * sl_m
         
         amt_sign = -amount if side == "buy" else amount
-        # create_order 已加固，会强制格式化所有的价格输入
         res_tp = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt_sign, tp_p, lev=self.leverage)
         self._track_order(res_tp, tp_p, "sell" if side == "buy" else "buy", abs(amount), is_tp=True)
         await self.bitfinex.create_order(self.bfx_symbol, "STOP", amt_sign, sl_p, lev=self.leverage, reduce_only=True)
 
     async def _relink_grid(self, side, price, amount):
-         # 实盘逻辑：重新获取实时余额
-         current_balance = await self.bitfinex.get_available_balance()
-         if current_balance <= 0.1: current_balance = 10.0
-         
-         level_notional = (current_balance * self.leverage) / self.grid_levels
+         c_bal = await self.bitfinex.get_available_balance()
+         if c_bal <= 0.1: c_bal = 10.0
+         level_notional = (c_bal * self.leverage) / self.grid_levels
          new_amt = float(level_notional / price)
          
-         if side == "buy": # 如果是买单成交，反向补卖单
+         if side == "buy": # 买单成交补卖单
              p = price * (1 + self.take_profit_pct/100)
              res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -new_amt, p, lev=self.leverage)
              self._track_order(res, p, "sell", new_amt, is_tp=False)
-         else: # 如果是卖单成交，反向补买单
+         else: # 卖单成交补买单
              p = price * (1 - self.take_profit_pct/100)
              res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", new_amt, p, lev=self.leverage)
              self._track_order(res, p, "buy", new_amt, is_tp=False)
@@ -338,15 +307,14 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         self.tracked_orders.clear()
 
     async def on_stop(self):
-        self.logger().info("🛑 策略停止，执行清场...")
+        self.logger().info("🛑 策略停止，清场中...")
         await self._cancel_all_grid_orders()
         await self.bitfinex.close_position(self.bfx_symbol)
 
     def format_status(self) -> str:
-        if not self.grid_initialized: return "初始化中..."
+        if not self.grid_initialized: return "正在等待行情..."
         return (
-            f"⚡ 极致超高频模式 | {self.bfx_symbol}\n"
-            f"💰 当前权益: {self.initial_capital + self.accumulated_profit:.2f}u | 目标: 20u\n"
-            f"� 间距: 0.1% | 🎯 止盈: 0.2% | 🛡️ 止损: 20%记\n"
-            f"🔢 挂单: {len(self.tracked_orders)}"
+            f"⚡ 极致超高频实盘 | {self.bfx_symbol}\n"
+            f"� 活跃挂单: {len(self.tracked_orders)}\n"
+            f"📐 杠杆比例: {self.leverage}x | 间距: {self.grid_spacing_pct}%"
         )
