@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 # ==========================================
-# === 🛡️ Bitfinex 智能校准 API ===
+# === 🛡️ Bitfinex 精准占位 API ===
 # ==========================================
 class BitfinexAPI:
     def __init__(self, api_key: str, api_secret: str, logger):
@@ -45,21 +45,18 @@ class BitfinexAPI:
         return [o for o in resp if isinstance(o, list) and len(o) > 3 and o[3] == symbol] if isinstance(resp, list) else []
 
     async def create_order(self, symbol, amount, price=None, lev=30, type="LIMIT", flags=0):
-        side_val = 1000000 if float(amount) > 0 else 2000000
-        cid = int(float(price) * 100) + side_val if price else int(time.time() % 1000000)
+        # 💡 CID 唯一化：按价格和方向锁定，同一位置绝对补不出第二张单
+        side_prefix = 1 if float(amount) > 0 else 2
+        cid = int(float(price) * 100) + (side_prefix * 1000000)
         req = {"type": type.upper(), "symbol": symbol, "amount": "{:.5f}".format(float(amount)), "lev": int(lev), "cid": cid, "flags": flags}
         if price: req["price"] = "{:.2f}".format(float(price))
         return await self.request("/auth/w/order/submit", req)
-
-    async def cancel_orders(self, ids: List[int]):
-        if not ids: return
-        return await self.request("/auth/w/order/cancel/multi", {"id": ids})
 
     async def cancel_all(self):
         return await self.request("/auth/w/order/cancel/multi", {"all": 1})
 
 # ==========================================
-# === 🚀 智能网格校准版 (强力对齐) ===
+# === 🚀 阵地防卫版 (稳定网格/拒绝扎堆) ===
 # ==========================================
 class 一天量化2026_3_2(ScriptStrategyBase):
     markets = {"okx": {"ETH-USDT"}} 
@@ -68,15 +65,15 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     leverage_long = 30
     leverage_short = 15
     grid_levels = 4         
-    grid_spacing = 0.001    # 0.1%
-    tp_pct = 0.002          # 0.2%
-    sl_roi = 0.20           # 20% ROI 止损
-    max_pos_amount = 0.16   
+    grid_spacing = 0.001    # 0.1% = 2刀
+    tp_pct = 0.002          # 0.2% 止盈
+    sl_roi = 0.20           
     
-    # 校准参数
-    last_grid_center = 0.0
+    # 💥 稳定重心逻辑
+    anchor_price = 0.0      # 阵地重心价格
+    max_pos_amount = 0.16   
+    check_interval = 8      
     last_check_time = 0
-    check_interval = 6      
     is_executing = False
 
     def __init__(self, connectors: Dict[str, Any]):
@@ -84,9 +81,6 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         api_key = "94a54e57696198788682c7e8c4b0d5adab9b69c70fa"
         api_secret = "2c15f19dd463e312397d557d54531f63e5961a12da7"
         self.bfx = BitfinexAPI(api_key, api_secret, self.logger())
-
-    async def on_stop(self):
-        await self.bfx.cancel_all()
 
     def on_tick(self):
         if self.current_timestamp - self.last_check_time >= self.check_interval:
@@ -97,7 +91,7 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     async def maintain_strategy(self):
         self.is_executing = True
         try:
-            # 1. 获取行情
+            # 1. 获取最新价
             ticker_url = f"https://api.bitfinex.com/v2/ticker/{self.bfx_symbol}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(ticker_url) as resp:
@@ -109,64 +103,54 @@ class 一天量化2026_3_2(ScriptStrategyBase):
             positions = await self.bfx.get_positions()
             orders = await self.bfx.get_open_orders(self.bfx_symbol)
 
-            curr_pos = 0.0
+            current_pos = 0.0
             entry_p = 0.0
             for pos in positions:
                 if pos[0] == self.bfx_symbol:
-                    curr_pos = float(pos[2])
+                    current_pos = float(pos[2])
                     entry_p = float(pos[3])
 
-            # 2. 🛡️ 止损止盈
-            if abs(curr_pos) > 0.0001:
-                lev = self.leverage_long if curr_pos > 0 else self.leverage_short
-                p_pct = (mid_p - entry_p) / entry_p if curr_pos > 0 else (entry_p - mid_p) / entry_p
-                if p_pct * lev < -self.sl_roi:
-                    self.logger().info("💣 熔断！清仓！")
+            # 2. 🛡️ 止损止盈 (优先级最高)
+            if abs(current_pos) > 0.0001:
+                lev = self.leverage_long if current_pos > 0 else self.leverage_short
+                pnl = (mid_p - entry_p)/entry_p if current_pos > 0 else (entry_p - mid_p)/entry_p
+                if pnl * lev < -self.sl_roi:
                     await self.bfx.cancel_all()
-                    await self.bfx.create_order(self.bfx_symbol, -curr_pos, type="MARKET")
+                    await self.bfx.create_order(self.bfx_symbol, -current_pos, type="MARKET")
                     return
-                # 挂止盈单 (确保只有一张)
-                tp_p = round(entry_p * (1 + self.tp_pct if curr_pos > 0 else 1 - self.tp_pct), 2)
+                # 唯一止盈单
+                tp_p = round(entry_p * (1 + self.tp_pct if current_pos > 0 else 1 - self.tp_pct), 2)
                 if not any(abs(float(o[16]) - tp_p) < 0.2 for o in orders):
-                    await self.bfx.create_order(self.bfx_symbol, -curr_pos, tp_p, lev=30)
+                    await self.bfx.create_order(self.bfx_symbol, -current_pos, tp_p, lev=30)
 
-            # 3. 🎯 智能校准：判断价格偏移
-            # 这里的逻辑是：如果价格偏离上次中心超过 0.04%，或者网格单缺失，则触发重挂
-            grid_orders = [o for o in orders if abs(float(o[16]) - mid_p) < (mid_p * 0.015)]
-            # 排除止盈单
-            non_tp_grids = [o for o in grid_orders if abs(float(o[16]) - (entry_p * (1.002 if curr_pos>0 else 0.998))) > 0.5] if abs(curr_pos)>0.0001 else grid_orders
-            
-            drift = abs(mid_p - self.last_grid_center) / mid_p if self.last_grid_center > 0 else 1.0
-            needs_regrid = drift > 0.0004 or len(non_tp_grids) < (self.grid_levels * 1.5)
+            # 3. 🎯 守护阵地：判断什么时候该整体搬家
+            # 只有价格跑出重心超过 3 层网格时，才允许重心移动
+            if self.anchor_price <= 0 or abs(mid_p - self.anchor_price) > (self.anchor_price * 0.003):
+                self.logger().info(f"📍 阵地迁移中: {self.anchor_price} -> {mid_p}")
+                self.anchor_price = mid_p
 
-            if needs_regrid:
-                self.logger().info(f"🔄 捕获到偏移 {drift*100:.3f}%，正在进行强力对齐补单...")
-                # A. 撤销原来的所有网格单 (不撤止盈单)
-                ids_to_cancel = [o[0] for o in non_tp_grids]
-                if ids_to_cancel: await self.bfx.cancel_orders(ids_to_cancel)
+            # 4. 补齐网格：只补缺失的坑位
+            for i in range(1, self.grid_levels + 1):
+                # 4.1 检查多头坑位 (锚点 - i*间隔)
+                p_buy = round(self.anchor_price * (1 - i * self.grid_spacing), 2)
+                if current_pos < self.max_pos_amount and not any(abs(float(o[16]) - p_buy) < 0.2 for o in orders):
+                    # 这个坑没单，补一个
+                    a_buy = max(0.005, round((margin * 0.45 * self.leverage_long) / (self.grid_levels * p_buy), 4))
+                    await self.bfx.create_order(self.bfx_symbol, a_buy, p_buy, lev=self.leverage_long, flags=4096)
                 
-                # B. 重新铺设阵列
-                for i in range(1, self.grid_levels + 1):
-                    # 买单层
-                    if curr_pos < self.max_pos_amount:
-                        p_buy = round(mid_p * (1 - i * self.grid_spacing), 2)
-                        a_buy = max(0.005, round((margin * 0.4 * self.leverage_long) / (self.grid_levels * p_buy), 4))
-                        await self.bfx.create_order(self.bfx_symbol, a_buy, p_buy, lev=self.leverage_long, flags=4096)
-                    
-                    # 卖单层
-                    if curr_pos > -self.max_pos_amount:
-                        p_sell = round(mid_p * (1 + i * self.grid_spacing), 2)
-                        a_sell = -max(0.005, round((margin * 0.4 * self.leverage_short) / (self.grid_levels * p_sell), 4))
-                        await self.bfx.create_order(self.bfx_symbol, a_sell, p_sell, lev=self.leverage_short, flags=4096)
-                
-                self.last_grid_center = mid_p
+                # 4.2 检查空头坑位 (锚点 + i*间隔)
+                p_sell = round(self.anchor_price * (1 + i * self.grid_spacing), 2)
+                if current_pos > -self.max_pos_amount and not any(abs(float(o[16]) - p_sell) < 0.2 for o in orders):
+                    # 这个坑没单，补一个
+                    a_sell = -max(0.005, round((margin * 0.45 * self.leverage_short) / (self.grid_levels * p_sell), 4))
+                    await self.bfx.create_order(self.bfx_symbol, a_sell, p_sell, lev=self.leverage_short, flags=4096)
 
-            self.logger().info(f"✅ 校准完毕 | 现价:{mid_p} | 持仓:{curr_pos:.4f}")
+            self.logger().info(f"✅ 阵地稳固 | 重心:{self.anchor_price} | 持仓:{current_pos:.4f}")
 
         except Exception as e:
-            self.logger().error(f"❌ 运行报错: {str(e)}")
+            self.logger().error(f"❌ 运行异常: {str(e)}")
         finally:
             self.is_executing = False
 
     def format_status(self) -> str:
-        return f"智能校准版 | 强力对齐开启 | 间距:0.1%"
+        return f"阵地稳固网格版 | 重心偏移阈值:0.3% | 严禁扎堆"
