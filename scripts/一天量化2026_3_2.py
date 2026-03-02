@@ -92,36 +92,31 @@ class BitfinexAPI:
 
     async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
         try:
-            # 强制将输入转换为 float，然后强制使用点作为分隔符
-            amt_val = float(amount)
-            price_val = float(price) if price else 0.0
-            
-            # 手动执行 1 位小数格式化，确保不受 locale 影响
-            # 如果 price_val 是 1965.6，这里强制生成 "1965.6" 字符串
-            price_str = "{:.1f}".format(price_val)
-            amount_str = "{:.5f}".format(amt_val)
+            # 1. 物理级强制格式化：不依赖系统 locale
+            # 逻辑：取 float -> 乘 10 -> 转 int -> 转 string -> 插入小数点
+            # 这样 1945.8 绝对会变成 "1945.8"，1945.986 绝对会变成 "1946.0"
+            def force_one_decimal(val):
+                v = int(float(val) * 10 + 0.5)
+                s = str(v)
+                return s[:-1] + "." + s[-1]
 
-            # 严格有序字典，对齐 Bitfinex V2 要求
+            amt_str = "{:.5f}".format(float(amount))
+            price_str = force_one_decimal(price) if price else "0.0"
+
             req = OrderedDict()
             req["type"] = order_type.upper()
             req["symbol"] = symbol
-            req["amount"] = amount_str
-            if price_val > 0:
-                # 价格熔断保护
-                if price_val > 8000:
-                    return {"error": True, "msg": f"PRICE_TOO_HIGH_{price_val}"}
+            req["amount"] = amt_str
+            if float(price_val := (price or 0)) > 0:
                 req["price"] = price_str
             
-            if lev:
-                req["lev"] = int(lev)
-            if reduce_only:
-                req["flags"] = 1024
+            if lev: req["lev"] = int(lev)
+            if reduce_only: req["flags"] = 1024
 
             resp = await self.request("/auth/w/order/submit", req)
             
             is_success = False
             msg = "未知错误"
-            
             if isinstance(resp, list) and len(resp) > 0 and resp[0] != "error":
                 is_success = True
             else:
@@ -129,11 +124,10 @@ class BitfinexAPI:
 
             if self.logger:
                 side = "🟢 买入" if amt_val > 0 else "🔴 卖出"
-                p_disp = req.get("price", "市价")
                 if is_success:
-                    self.logger.info(f"{side} 已申报 | 价格: {p_disp} | 数量: {amount_str}")
+                    self.logger.info(f"{side} 已申报 | 价格: {price_str} | 数量: {amount_str}")
                 else:
-                    self.logger.error(f"❌ 下单失败 | 价格: {p_disp} | 原因: {msg}")
+                    self.logger.error(f"❌ 下单失败 | 价格: {price_str} | 原因: {msg}")
             return resp
         except Exception as e:
             if self.logger: self.logger.error(f"下单异常: {e}")
@@ -180,18 +174,18 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     # --- 策略配置 ---
     bfx_symbol = "tETHF0:USTF0"
     initial_capital = 10.0
-    leverage = 35
-    grid_levels = 4
-    lower_bound = 1920.0
-    upper_bound = 1999.0
+    leverage = 30                 # 用户指定：30倍杠杆
+    grid_levels = 4               # 用户指定：4层网格
+    lower_bound = 1920.0          # 用户指定：1920下线
+    upper_bound = 1999.0          # 用户指定：1999上线
     
     # ⚡ 超密网格设置
-    grid_spacing_pct = 0.1        # 0.1% 开仓间距
-    take_profit_pct = 0.2         # 0.2% 止盈点
-    total_profit_target = 20.0    # 目标：20u
-    stop_loss_margin_pct = 20.0   # 20% 保证金止损
+    grid_spacing_pct = 0.1
+    take_profit_pct = 0.2
+    total_profit_target = 20.0
+    stop_loss_margin_pct = 20.0
     
-    recenter_threshold_pct = 0.2  # 0.2% 偏移即重布网
+    recenter_threshold_pct = 0.5
     check_interval = 8            # 8秒检查一次
     
     # --- 状态变量 ---
@@ -199,7 +193,6 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     grid_center_price = 0.0
     grid_initialized = False
     tracked_orders: Dict[int, Dict] = {}
-    accumulated_profit = 0.0
     
     def __init__(self, connectors: Dict[str, Any]):
         super().__init__(connectors)
@@ -217,7 +210,6 @@ class 一天量化2026_3_2(ScriptStrategyBase):
 
         self.bitfinex = BitfinexAPI(api_key, api_secret, logger=self.logger())
         self.tracked_orders = {}
-        self.accumulated_profit = 0.0
 
     def on_tick(self):
         current_time = self.current_timestamp
@@ -227,11 +219,6 @@ class 一天量化2026_3_2(ScriptStrategyBase):
 
     async def _grid_tick(self):
         try:
-            if self.accumulated_profit >= self.total_profit_target:
-                self.logger().info(f"🏆 目标达成! 收益 {self.accumulated_profit:.2f}u. 全清场...")
-                await self.on_stop()
-                return
-
             current_price = await self.bitfinex.get_ticker(self.bfx_symbol)
             if current_price <= 0: return
             
@@ -258,30 +245,31 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     async def _deploy_full_grid(self, center_price: float):
         self.grid_center_price = center_price
         spacing = self.grid_spacing_pct / 100
-        current_equity = self.initial_capital + self.accumulated_profit
         
-        # 严格计算：每层名义价值 = (总权益 * 杠杆) / 层数
-        # 10U * 10倍杠杆 = 100U 总额。10层网格，则每层 10U。
-        level_notional = (current_equity * self.leverage) / self.grid_levels
+        # 核心实盘逻辑：直接读取交易所钱包可用余额
+        current_balance = await self.bitfinex.get_available_balance()
+        if current_balance <= 0.1: # 如果余额太低（小于0.1u），使用保底 10u 逻辑或报错
+            current_balance = 10.0
+            
+        level_notional = (current_balance * self.leverage) / self.grid_levels
         
-        self.logger().info(f"📏 超密撒网: 总本金={current_equity:.2f}u, 杠杆={self.leverage}x, 每层名义价值={level_notional:.2f}u")
+        self.logger().info(f"📏 实盘撒网: 钱包余额={current_balance:.2f}u, 杠杆={self.leverage}x, 每层名义={level_notional:.2f}u")
         
         for level in range(1, self.grid_levels + 1):
-            # 买单
-            bp = float(center_price * (1 - level * spacing))
-            if bp >= self.lower_bound:
-                amt = float(level_notional / bp)
-                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt, bp, lev=self.leverage)
-                self._track_order(res, bp, "buy", amt, is_tp=False)
+            # 显式重置变量，防止循环污染
+            current_bp = float(center_price * (1 - level * spacing))
+            if current_bp >= self.lower_bound:
+                amt = float(level_notional / current_bp)
+                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt, current_bp, lev=self.leverage)
+                self._track_order(res, current_bp, "buy", amt, is_tp=False)
             
-            # 卖单
-            sp = float(center_price * (1 + level * spacing))
-            if sp <= self.upper_bound:
-                amt = float(level_notional / sp)
-                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -amt, sp, lev=self.leverage)
-                self._track_order(res, sp, "sell", amt, is_tp=False)
+            # 卖单同样显式重置
+            current_sp = float(center_price * (1 + level * spacing))
+            if current_sp <= self.upper_bound:
+                amt = float(level_notional / current_sp)
+                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -amt, current_sp, lev=self.leverage)
+                self._track_order(res, current_sp, "sell", amt, is_tp=False)
             
-            # 每下单一对，稍微喘息一下，Bitfinex 喜欢有秩序的请求
             await asyncio.sleep(0.3)
 
     def _track_order(self, api_response, price, side, amount, is_tp):
@@ -309,9 +297,7 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         for oid, info in filled_orders:
             side, price, amount, is_tp = info["side"], info["price"], info["amount"], info["is_tp"]
             if is_tp:
-                pft = (amount * price) * (self.take_profit_pct / 100)
-                self.accumulated_profit += pft
-                self.logger().info(f"💰 止盈成功! +{pft:.4f}u | 累计: {self.accumulated_profit:.2f}u")
+                self.logger().info(f"💰 止盈成功! 申报补单...")
                 asyncio.ensure_future(self._relink_grid(side, price, amount))
             else:
                 self.logger().info(f"🔔 入场成交: {side} @ {price}, 挂 0.2% 止盈 + 20% 止损")
@@ -331,12 +317,11 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         await self.bitfinex.create_order(self.bfx_symbol, "STOP", amt_sign, sl_p, lev=self.leverage, reduce_only=True)
 
     async def _relink_grid(self, side, price, amount):
-         # 复利核心：使用最新权益（含收益）重新计算名义价值
-         current_equity = self.initial_capital + self.accumulated_profit
-         # 名义价值 = (最新总资产 * 杠杆) / 网格层数
-         level_notional = (current_equity * self.leverage) / self.grid_levels
+         # 实盘逻辑：重新获取实时余额
+         current_balance = await self.bitfinex.get_available_balance()
+         if current_balance <= 0.1: current_balance = 10.0
          
-         # 计算新订单的数量
+         level_notional = (current_balance * self.leverage) / self.grid_levels
          new_amt = float(level_notional / price)
          
          if side == "buy": # 如果是买单成交，反向补卖单
