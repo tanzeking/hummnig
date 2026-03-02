@@ -331,14 +331,19 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         await self.bitfinex.create_order(self.bfx_symbol, "STOP", amt_sign, sl_p, lev=self.leverage, reduce_only=True)
 
     async def _relink_grid(self, side, price, amount):
-         equity = self.initial_capital + self.accumulated_profit
-         notional = (equity * self.leverage) / self.grid_levels
-         new_amt = round(notional / price, 4)
-         if side == "buy":
+         # 复利核心：使用最新权益（含收益）重新计算名义价值
+         current_equity = self.initial_capital + self.accumulated_profit
+         # 名义价值 = (最新总资产 * 杠杆) / 网格层数
+         level_notional = (current_equity * self.leverage) / self.grid_levels
+         
+         # 计算新订单的数量
+         new_amt = float(level_notional / price)
+         
+         if side == "buy": # 如果是买单成交，反向补卖单
              p = price * (1 + self.take_profit_pct/100)
              res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -new_amt, p, lev=self.leverage)
              self._track_order(res, p, "sell", new_amt, is_tp=False)
-         else:
+         else: # 如果是卖单成交，反向补买单
              p = price * (1 - self.take_profit_pct/100)
              res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", new_amt, p, lev=self.leverage)
              self._track_order(res, p, "buy", new_amt, is_tp=False)
