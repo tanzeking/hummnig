@@ -30,6 +30,8 @@ class BitfinexAPI:
 
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
+        # 增加微秒级的延迟，确保并发请求时的 Nonce 强制唯一
+        await asyncio.sleep(0.01)
         nonce = str(int(time.time() * 1000000))
         body = json.dumps(payload_dict) if payload_dict else "{}"
         signature_payload = f"/api/v2{endpoint}{nonce}{body}"
@@ -94,9 +96,17 @@ class BitfinexAPI:
             req["flags"] = flags
 
         resp = await self.request("/auth/w/order/submit", req)
+        
+        # 安全解析响应，防止 object of type 'int' has no len()
+        error_msg = None
+        if isinstance(resp, list) and len(resp) >= 8:
+            if resp[6] == "ERROR":
+                error_msg = resp[7]
+        
         if self.logger:
             side_str = "买" if float(amount) > 0 else "卖"
-            self.logger.info(f"[{symbol}下单] {order_type} {side_str} {abs(float(amount)):.6f} @ {price} | 响应: {resp}")
+            status_str = f"❌ 失败: {error_msg}" if error_msg else "✅ 成功"
+            self.logger.info(f"[{symbol}下单] {order_type} {side_str} {abs(float(amount)):.6f} @ {price} | {status_str}")
         return resp
 
     async def fetch_open_orders(self, symbol: str) -> list:
