@@ -103,11 +103,14 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         await self.api.req("/auth/w/order/cancel", {"all": 1})
         self.tracked_orders.clear()
         
+        # 1. 动态获取实时余额
         bal = await self.api.get_bal()
         if bal <= 0.1: bal = 10.0 # 强制 10U 容错
             
-        unit_val = (bal * self.LEV) / self.LEVELS
-        self.logger().info(f"💰 实盘参数: 余额 {bal:.2f}u | 杠杆 {self.LEV}x | 每层货值 {unit_val:.2f}u")
+        # 2. 核心分配：(余额 * 杠杆 * 0.9安全系数) / (买单4层 + 卖单4层)
+        # 确保 8 张单子的总货值不超出 300U 的购买力限制
+        unit_val = (bal * self.LEV * 0.9) / (self.LEVELS * 2)
+        self.logger().info(f"💰 实盘平衡: 账号可用 {bal:.2f}u | 杠杆 {self.LEV}x | 每层分配 {unit_val:.2f}u")
 
         for i in range(1, self.LEVELS + 1):
             # 撒买网
