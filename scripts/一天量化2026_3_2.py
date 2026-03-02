@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 # ==========================================
-# === 🛡️ Bitfinex 极速追踪 API ===
+# === 🛡️ Bitfinex 智能校准 API ===
 # ==========================================
 class BitfinexAPI:
     def __init__(self, api_key: str, api_secret: str, logger):
@@ -45,7 +45,6 @@ class BitfinexAPI:
         return [o for o in resp if isinstance(o, list) and len(o) > 3 and o[3] == symbol] if isinstance(resp, list) else []
 
     async def create_order(self, symbol, amount, price=None, lev=30, type="LIMIT", flags=0):
-        # 💡 CID 唯一化：加入方向标志，防止多空同价位冲突
         side_val = 1000000 if float(amount) > 0 else 2000000
         cid = int(float(price) * 100) + side_val if price else int(time.time() % 1000000)
         req = {"type": type.upper(), "symbol": symbol, "amount": "{:.5f}".format(float(amount)), "lev": int(lev), "cid": cid, "flags": flags}
@@ -53,13 +52,14 @@ class BitfinexAPI:
         return await self.request("/auth/w/order/submit", req)
 
     async def cancel_orders(self, ids: List[int]):
+        if not ids: return
         return await self.request("/auth/w/order/cancel/multi", {"id": ids})
 
     async def cancel_all(self):
         return await self.request("/auth/w/order/cancel/multi", {"all": 1})
 
 # ==========================================
-# === 🚀 极速行情追踪版 (0.1% 间距) ===
+# === 🚀 智能网格校准版 (强力对齐) ===
 # ==========================================
 class 一天量化2026_3_2(ScriptStrategyBase):
     markets = {"okx": {"ETH-USDT"}} 
@@ -68,13 +68,15 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     leverage_long = 30
     leverage_short = 15
     grid_levels = 4         
-    grid_spacing = 0.001    # 0.1% 间距约为 2 刀
-    tp_pct = 0.002          # 0.2% 止盈
+    grid_spacing = 0.001    # 0.1%
+    tp_pct = 0.002          # 0.2%
     sl_roi = 0.20           # 20% ROI 止损
     max_pos_amount = 0.16   
     
+    # 校准参数
+    last_grid_center = 0.0
     last_check_time = 0
-    check_interval = 6      # 加快扫描速度到 6s
+    check_interval = 6      
     is_executing = False
 
     def __init__(self, connectors: Dict[str, Any]):
@@ -95,7 +97,7 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     async def maintain_strategy(self):
         self.is_executing = True
         try:
-            # 1. 获取最新市场价
+            # 1. 获取行情
             ticker_url = f"https://api.bitfinex.com/v2/ticker/{self.bfx_symbol}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(ticker_url) as resp:
@@ -105,7 +107,7 @@ class 一天量化2026_3_2(ScriptStrategyBase):
 
             margin = await self.bfx.get_margin_info()
             positions = await self.bfx.get_positions()
-            open_orders = await self.bfx.get_open_orders(self.bfx_symbol)
+            orders = await self.bfx.get_open_orders(self.bfx_symbol)
 
             curr_pos = 0.0
             entry_p = 0.0
@@ -114,58 +116,57 @@ class 一天量化2026_3_2(ScriptStrategyBase):
                     curr_pos = float(pos[2])
                     entry_p = float(pos[3])
 
-            # 2. 🛡️ 止损/止盈检查
+            # 2. 🛡️ 止损止盈
             if abs(curr_pos) > 0.0001:
                 lev = self.leverage_long if curr_pos > 0 else self.leverage_short
-                profit_pct = (mid_p - entry_p) / entry_p if curr_pos > 0 else (entry_p - mid_p) / entry_p
-                if profit_pct * lev < -self.sl_roi:
-                    self.logger().info("💣 触发止损！清仓！")
+                p_pct = (mid_p - entry_p) / entry_p if curr_pos > 0 else (entry_p - mid_p) / entry_p
+                if p_pct * lev < -self.sl_roi:
+                    self.logger().info("💣 熔断！清仓！")
                     await self.bfx.cancel_all()
                     await self.bfx.create_order(self.bfx_symbol, -curr_pos, type="MARKET")
                     return
-                # 挂止盈
+                # 挂止盈单 (确保只有一张)
                 tp_p = round(entry_p * (1 + self.tp_pct if curr_pos > 0 else 1 - self.tp_pct), 2)
-                if not any(abs(float(o[16]) - tp_p) < 0.2 for o in open_orders):
+                if not any(abs(float(o[16]) - tp_p) < 0.2 for o in orders):
                     await self.bfx.create_order(self.bfx_symbol, -curr_pos, tp_p, lev=30)
 
-            # 3. 🧹 行情追踪清理 (收紧到 0.4% 的超窄范围)
-            # 如果挂单离现价超过 8 刀，直接撤销重挂，保持阵地跟随价格
-            to_cancel = []
-            for o in open_orders:
-                o_price = float(o[16])
-                # 如果不是止盈单，且距离现价太远，就撤掉
-                if abs(o_price - mid_p) > (mid_p * 0.004): 
-                    to_cancel.append(o[0])
+            # 3. 🎯 智能校准：判断价格偏移
+            # 这里的逻辑是：如果价格偏离上次中心超过 0.04%，或者网格单缺失，则触发重挂
+            grid_orders = [o for o in orders if abs(float(o[16]) - mid_p) < (mid_p * 0.015)]
+            # 排除止盈单
+            non_tp_grids = [o for o in grid_orders if abs(float(o[16]) - (entry_p * (1.002 if curr_pos>0 else 0.998))) > 0.5] if abs(curr_pos)>0.0001 else grid_orders
             
-            if to_cancel:
-                self.logger().info(f"🔄 行情走远，正在主动清理 {len(to_cancel)} 个滞后单...")
-                await self.bfx.cancel_orders(to_cancel)
-                await asyncio.sleep(1) # 给交易所 1 秒同步数据
-                open_orders = await self.bfx.get_open_orders(self.bfx_symbol)
+            drift = abs(mid_p - self.last_grid_center) / mid_p if self.last_grid_center > 0 else 1.0
+            needs_regrid = drift > 0.0004 or len(non_tp_grids) < (self.grid_levels * 1.5)
 
-            # 4. 补齐贴身网格
-            l_grids = [o for o in open_orders if float(o[6]) > 0 and abs(float(o[16]) - mid_p) < (mid_p * 0.015)]
-            s_grids = [o for o in open_orders if float(o[6]) < 0 and abs(float(o[16]) - mid_p) < (mid_p * 0.015)]
+            if needs_regrid:
+                self.logger().info(f"🔄 捕获到偏移 {drift*100:.3f}%，正在进行强力对齐补单...")
+                # A. 撤销原来的所有网格单 (不撤止盈单)
+                ids_to_cancel = [o[0] for o in non_tp_grids]
+                if ids_to_cancel: await self.bfx.cancel_orders(ids_to_cancel)
+                
+                # B. 重新铺设阵列
+                for i in range(1, self.grid_levels + 1):
+                    # 买单层
+                    if curr_pos < self.max_pos_amount:
+                        p_buy = round(mid_p * (1 - i * self.grid_spacing), 2)
+                        a_buy = max(0.005, round((margin * 0.4 * self.leverage_long) / (self.grid_levels * p_buy), 4))
+                        await self.bfx.create_order(self.bfx_symbol, a_buy, p_buy, lev=self.leverage_long, flags=4096)
+                    
+                    # 卖单层
+                    if curr_pos > -self.max_pos_amount:
+                        p_sell = round(mid_p * (1 + i * self.grid_spacing), 2)
+                        a_sell = -max(0.005, round((margin * 0.4 * self.leverage_short) / (self.grid_levels * p_sell), 4))
+                        await self.bfx.create_order(self.bfx_symbol, a_sell, p_sell, lev=self.leverage_short, flags=4096)
+                
+                self.last_grid_center = mid_p
 
-            if curr_pos < self.max_pos_amount and len(l_grids) < self.grid_levels:
-                await self.deploy_one("long", mid_p, margin, len(l_grids))
-            if curr_pos > -self.max_pos_amount and len(s_grids) < self.grid_levels:
-                await self.deploy_one("short", mid_p, margin, len(s_grids))
-
-            self.logger().info(f"📊 追踪中 | 现价:{mid_p} | 持仓:{curr_pos:.4f} | 网格:{len(l_grids)}买/{len(s_grids)}卖")
+            self.logger().info(f"✅ 校准完毕 | 现价:{mid_p} | 持仓:{curr_pos:.4f}")
 
         except Exception as e:
-            self.logger().error(f"❌ 运行错误: {str(e)}")
+            self.logger().error(f"❌ 运行报错: {str(e)}")
         finally:
             self.is_executing = False
 
-    async def deploy_one(self, side, mid_p, margin, count):
-        idx = count + 1
-        use_m = margin if margin > 1.0 else 5.0
-        p = round(mid_p * (1 - idx * self.grid_spacing if side=="long" else 1 + idx * self.grid_spacing), 2)
-        a = max(0.005, round((use_m * 0.45 * (self.leverage_long if side=="long" else self.leverage_short)) / (self.grid_levels * p), 4))
-        if side == "short": a = -a
-        await self.bfx.create_order(self.bfx_symbol, a, p, lev=(self.leverage_long if side=="long" else self.leverage_short), flags=4096)
-
     def format_status(self) -> str:
-        return f"动态追踪版 | 自动洗牌僵尸单 | 间距:0.1%"
+        return f"智能校准版 | 强力对齐开启 | 间距:0.1%"
