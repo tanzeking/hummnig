@@ -32,13 +32,13 @@ class BitfinexAPI:
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
         
-        # 强制微调延迟，防止高频下单时的微秒 Nonce 碰撞
-        await asyncio.sleep(0.12)
-        # 使用 16 位微秒 Nonce，这是最稳健的，防止 nonce small 错误
+        # 强制延迟，确保 Nonce 严格递增
+        await asyncio.sleep(0.15)
         nonce = str(int(time.time() * 1000000))
         
-        # 核心：使用紧凑 JSON 且保持所有环境下的 body 字符串绝对唯一
+        # 手动构建紧凑 JSON 字符串，确保字段顺序和签名完全一致
         if payload_dict:
+            # OrderedDict 配合特定的 separators 确保 100% 紧凑
             body = json.dumps(payload_dict, separators=(',', ':'))
         else:
             body = "{}"
@@ -59,9 +59,8 @@ class BitfinexAPI:
                     text = await resp.text()
                     try:
                         data = json.loads(text)
-                        # 标准化错误返回
                         if isinstance(data, list) and len(data) >= 3 and data[0] == "error":
-                            return {"error": True, "code": data[1], "msg": data[2]}
+                            return {"error": True, "msg": f"{data[1]}: {data[2]}"}
                         return data
                     except:
                         return {"error": True, "msg": text}
@@ -91,46 +90,47 @@ class BitfinexAPI:
         return 0.0
 
     async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
-        amt_val = float(amount)
-        amt_str = "{:.5f}".format(amt_val)
-        p_str = "{:.1f}".format(float(price)) if price else None
-        
-        # 严格按照 Bitfinex 官方文档建议的字段顺序排列 (使用 OrderedDict)
-        req = OrderedDict()
-        req["symbol"] = symbol
-        req["type"] = order_type.upper()
-        req["price"] = p_str if p_str else "0"
-        req["amount"] = amt_str
-        
-        if lev is not None:
-             req["lev"] = int(lev)
-        if reduce_only:
-             req["flags"] = 1024
+        try:
+            amt_val = float(amount)
+            price_val = float(price) if price else 0.0
+            
+            # 价格熔断保护：对于 ETH，如果价格算出来大于 5000 或者小于 500，绝对是逻辑出错了
+            if price_val > 5000 or (price_val < 500 and price_val > 0):
+                self.logger.error(f"⚠️ 价格异常拦截: {price_val}，请检查网格计算逻辑！")
+                return {"error": True, "msg": "PRICE_OUT_OF_RANGE"}
 
-        resp = await self.request("/auth/w/order/submit", req)
-        
-        is_success = False
-        error_info = "未知错误"
-        
-        if isinstance(resp, list):
-            if len(resp) > 0 and resp[0] != "error":
-                is_success = True
-            elif len(resp) >= 3:
-                error_info = f"{resp[2]}"
-        elif isinstance(resp, dict):
-            if not resp.get("error"):
+            # 严格按照 Bitfinex 官方要求的字典顺序构建 OrderedDict
+            req = OrderedDict()
+            req["type"] = order_type.upper()
+            req["symbol"] = symbol
+            req["amount"] = "{:.5f}".format(amt_val)
+            if price_val > 0:
+                req["price"] = "{:.1f}".format(price_val)
+            if lev:
+                req["lev"] = int(lev)
+            if reduce_only:
+                req["flags"] = 1024
+
+            resp = await self.request("/auth/w/order/submit", req)
+            
+            is_success = False
+            err_msg = ""
+            if isinstance(resp, list) and len(resp) > 0 and resp[0] != "error":
                 is_success = True
             else:
-                error_info = resp.get("msg", resp.get("message", str(resp)))
-        
-        if self.logger:
-            side_str = "🟢 买入" if amt_val > 0 else "🔴 卖出"
-            p_display = p_str if p_str else "市价"
-            if is_success:
-                self.logger.info(f"{side_str} 成功 | 价格: {p_display} | 数量: {abs(amt_val):.4f}")
-            else:
-                self.logger.error(f"❌ 下单失败 | 价格: {p_display} | 原因: {error_info}")
-        return resp
+                err_msg = resp.get("msg", str(resp)) if isinstance(resp, dict) else str(resp)
+
+            if self.logger:
+                side = "🟢 买入" if amt_val > 0 else "🔴 卖出"
+                p_disp = "{:.1f}".format(price_val) if price_val > 0 else "市价"
+                if is_success:
+                    self.logger.info(f"{side} 成功 | 价格: {p_disp} | 数量: {abs(amt_val):.4f}")
+                else:
+                    self.logger.error(f"❌ 下单失败 | 价格: {p_disp} | 原因: {err_msg}")
+            return resp
+        except Exception as e:
+            if self.logger: self.logger.error(f"下单代码崩溃: {e}")
+            return {"error": True, "msg": str(e)}
 
     async def fetch_open_orders(self, symbol: str) -> list:
         resp = await self.request("/auth/r/orders")
