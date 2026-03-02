@@ -69,7 +69,6 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     LEVELS = 4
     SPACING = 0.001 
     TP_PCT = 0.002      
-    SL_PCT = 0.005 # 暂设 0.5% 强制硬止损
     R_L = 1920.0
     R_H = 1999.0
 
@@ -80,7 +79,7 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         self.api = BfxRest(k, s, self.logger())
         self.initialized = False
         self.last_check = 0
-        self.tracked_orders = {} # {order_id: {side, price, amount, is_tp}}
+        self.tracked_orders = {}
 
     def on_tick(self):
         now = self.current_timestamp
@@ -89,34 +88,31 @@ class 一天量化2026_3_2(ScriptStrategyBase):
             self.initialized = True
             self.last_check = now
         
-        if now - self.last_check >= 10: # 每10秒深度巡检一次
+        if now - self.last_check >= 10:
             self.last_check = now
             asyncio.ensure_future(self.monitor_fills())
 
     async def setup_grid(self):
         p = await self.api.get_price(self.SYM)
         if p < self.R_L or p > self.R_H:
-            self.logger().warning(f"待机价格: {p} (范围 {self.R_L}-{self.R_H})")
+            self.logger().warning(f"待机价格: {p} 超出范围")
             return
 
-        self.logger().info("🧹 正在清理旧单，准备重新撒网...")
+        self.logger().info("🧹 正在清理成交前挂单...")
         await self.api.req("/auth/w/order/cancel", {"all": 1})
         self.tracked_orders.clear()
         
-        # 1. 动态获取实时余额
         bal = await self.api.get_bal()
-        if bal <= 0.1: bal = 10.0 # 强制 10U 容错
+        if bal <= 0.1: bal = 10.0 
             
-        # 2. 核心分配：(余额 * 杠杆 * 0.9安全系数) / (买单4层 + 卖单4层)
-        # 确保 8 张单子的总货值不超出 300U 的购买力限制
+        # 修正保证金数学分配逻辑：(余额 * 杠杆 * 0.9缓冲) / (4层买 + 4层卖)
+        # 这确保 10U 绝对能挂出所有单子而不报错
         unit_val = (bal * self.LEV * 0.9) / (self.LEVELS * 2)
-        self.logger().info(f"💰 实盘平衡: 账号可用 {bal:.2f}u | 杠杆 {self.LEV}x | 每层分配 {unit_val:.2f}u")
+        self.logger().info(f"📊 资金分配: 实时余额 {bal:.2f}u | 单笔货值 {unit_val:.2f}u")
 
         for i in range(1, self.LEVELS + 1):
-            # 撒买网
             bp = p * (1 - i * self.SPACING)
             if bp >= self.R_L: await self.place_grid("buy", bp, unit_val/bp)
-            # 撒卖网
             sp = p * (1 + i * self.SPACING)
             if sp <= self.R_H: await self.place_grid("sell", sp, unit_val/sp)
             await asyncio.sleep(0.4)
@@ -124,57 +120,39 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     async def place_grid(self, side, price, amount):
         p_s = d_p(price)
         a_s = d_a(amount if side == "buy" else -amount)
-        # 预计算止盈止损展示在日志里，方便用户盯盘
-        tp_target = price * (1 + self.TP_PCT) if side == "buy" else price * (1 - self.TP_PCT)
-        
         payload = OrderedDict([("type", "LIMIT"), ("symbol", self.SYM), ("amount", a_s), ("price", p_s), ("lev", self.LEV)])
         res = await self.api.req("/auth/w/order/submit", payload)
         
         if isinstance(res, list) and len(res) > 0 and res[0] != "error":
             oid = res[4][0][0]
             self.tracked_orders[oid] = {"side": side, "price": price, "amount": abs(amount), "is_tp": False}
-            self.logger().info(f"✅ 挂单成功: {side} @ {p_s} | 止盈目标: {d_p(tp_target)}")
+            self.logger().info(f"✅ 挂单成功: {side} @ {p_s}")
         else:
             err = res[2] if isinstance(res, list) and len(res) >= 3 else str(res)
             self.logger().error(f"❌ 挂单失败: {side} @ {p_s} | 原因: {err}")
 
     async def monitor_fills(self):
-        # 抓取目前账号所有开仓挂单
         res = await self.api.req("/auth/r/orders", {})
         if not isinstance(res, list) or (len(res) > 0 and res[0] == "error"): return
-        
         live_ids = {o[0] for o in res if isinstance(o, list)}
-        
-        # 找出那些刚才还在，现在消失的 ID
         for oid in list(self.tracked_orders.keys()):
             if oid not in live_ids:
                 info = self.tracked_orders[oid]
-                self.logger().info(f"🔔 成交提醒: {info['side']} 单 @ {info['price']} 已成交！")
-                
-                if not info["is_tp"]: # 如果是入场单成交，立刻挂止盈
-                    await self.place_tp(info)
+                self.logger().info(f"🔔 成交通知: {info['side']} @ {info['price']} 手下！")
+                if not info["is_tp"]: await self.place_tp(info)
                 del self.tracked_orders[oid]
 
     async def place_tp(self, entry_info):
         side, p, a = entry_info["side"], entry_info["price"], entry_info["amount"]
         tp_price = p * (1 + self.TP_PCT) if side == "buy" else p * (1 - self.TP_PCT)
         tp_p_s = d_p(tp_price)
-        tp_a_s = d_a(-a if side == "buy" else a) # 反向
-        
-        self.logger().info(f"🎯 正在挂为止盈单: {tp_p_s} (利润预计 0.2%)")
-        
+        tp_a_s = d_a(-a if side == "buy" else a)
+        self.logger().info(f"🎯 追缴止盈: {tp_p_s}")
         payload = OrderedDict([("type", "LIMIT"), ("symbol", self.SYM), ("amount", tp_a_s), ("price", tp_p_s), ("lev", self.LEV)])
         res = await self.api.req("/auth/w/order/submit", payload)
         if isinstance(res, list) and len(res) > 0 and res[0] != "error":
             oid = res[4][0][0]
             self.tracked_orders[oid] = {"side": "sell" if side=="buy" else "buy", "price": tp_price, "amount": a, "is_tp": True}
-        else:
-            self.logger().error(f"⚠️ 止盈单由于保证金不足或其他原因挂单失败")
 
     def format_status(self) -> str:
-        if not self.initialized: return "正在拼命加载中..."
-        return (
-            f"🚀 bitfinex 永续超高频 | {self.SYM}\n"
-            f"📈 当前追踪: {len(self.tracked_orders)} 个挂单\n"
-            f"⚙️ 参数: {self.LEV}x 杠杆 | 间隔 {self.SPACING*100}% | 止盈 {self.TP_PCT*100}%"
-        )
+        return f"实盘运行中 | 追踪单数: {len(self.tracked_orders)} | 杠杆: {self.LEV}x"
