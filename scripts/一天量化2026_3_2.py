@@ -5,6 +5,7 @@ import time
 import hmac
 import hashlib
 import aiohttp
+from collections import OrderedDict
 from typing import Dict, Any, List, Optional
 from decimal import Decimal
 
@@ -31,13 +32,16 @@ class BitfinexAPI:
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
         
-        # 强制微小延迟，防止高频下 Nonce 冲突
-        await asyncio.sleep(0.1)
-        # 使用 13 位毫秒 Nonce，这是 Bitfinex 最兼容的格式
-        nonce = str(int(time.time() * 1000))
+        # 强制微调延迟，防止高频下单时的微秒 Nonce 碰撞
+        await asyncio.sleep(0.12)
+        # 使用 16 位微秒 Nonce，这是最稳健的，防止 nonce small 错误
+        nonce = str(int(time.time() * 1000000))
         
-        # 核心：必须使用紧凑型 JSON 且不带空格
-        body = json.dumps(payload_dict, separators=(',', ':')) if payload_dict else "{}"
+        # 核心：使用紧凑 JSON 且保持所有环境下的 body 字符串绝对唯一
+        if payload_dict:
+            body = json.dumps(payload_dict, separators=(',', ':'))
+        else:
+            body = "{}"
         
         signature_payload = f"/api/v2{endpoint}{nonce}{body}"
         sig = hmac.new(self.api_secret.encode('utf8'), signature_payload.encode('utf8'), hashlib.sha384).hexdigest()
@@ -55,7 +59,7 @@ class BitfinexAPI:
                     text = await resp.text()
                     try:
                         data = json.loads(text)
-                        # 如果返回的是报错列表 ["error", 10100, "msg"]，格式化为标准字典方便处理
+                        # 标准化错误返回
                         if isinstance(data, list) and len(data) >= 3 and data[0] == "error":
                             return {"error": True, "code": data[1], "msg": data[2]}
                         return data
@@ -87,20 +91,21 @@ class BitfinexAPI:
         return 0.0
 
     async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
-        amt_str = "{:.5f}".format(float(amount))
+        amt_val = float(amount)
+        amt_str = "{:.5f}".format(amt_val)
+        p_str = "{:.1f}".format(float(price)) if price else None
         
-        # 严格按照 Bitfinex 偏好的字段顺序排列
-        req = {
-            "type": order_type.upper(),
-            "symbol": symbol,
-            "amount": amt_str
-        }
-        if price:
-            req["price"] = "{:.1f}".format(float(price))
+        # 严格按照 Bitfinex 官方文档建议的字段顺序排列 (使用 OrderedDict)
+        req = OrderedDict()
+        req["symbol"] = symbol
+        req["type"] = order_type.upper()
+        req["price"] = p_str if p_str else "0"
+        req["amount"] = amt_str
+        
         if lev is not None:
-            req["lev"] = int(lev)
+             req["lev"] = int(lev)
         if reduce_only:
-            req["flags"] = 1024
+             req["flags"] = 1024
 
         resp = await self.request("/auth/w/order/submit", req)
         
@@ -108,7 +113,6 @@ class BitfinexAPI:
         error_info = "未知错误"
         
         if isinstance(resp, list):
-            # 只有当第一个元素不是 'error' 且是列表时才判定为成功
             if len(resp) > 0 and resp[0] != "error":
                 is_success = True
             elif len(resp) >= 3:
@@ -120,10 +124,10 @@ class BitfinexAPI:
                 error_info = resp.get("msg", resp.get("message", str(resp)))
         
         if self.logger:
-            side_str = "🟢 买入" if float(amount) > 0 else "🔴 卖出"
-            p_display = "{:.1f}".format(float(price)) if price else "市价"
+            side_str = "🟢 买入" if amt_val > 0 else "🔴 卖出"
+            p_display = p_str if p_str else "市价"
             if is_success:
-                self.logger.info(f"{side_str} 成功 | 价格: {p_display} | 数量: {abs(float(amount)):.4f}")
+                self.logger.info(f"{side_str} 成功 | 价格: {p_display} | 数量: {abs(amt_val):.4f}")
             else:
                 self.logger.error(f"❌ 下单失败 | 价格: {p_display} | 原因: {error_info}")
         return resp
