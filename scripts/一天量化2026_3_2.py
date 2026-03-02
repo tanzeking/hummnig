@@ -31,11 +31,16 @@ class BitfinexAPI:
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
         
-        # 使用纳秒级时间戳作为 Nonce，确保高频下单时绝对唯一且递增
-        nonce = str(time.time_ns() // 1000)
+        # 使用毫秒级时间戳作为 Nonce，这是最稳健的方式
+        nonce = str(int(time.time() * 1000))
         
-        # Bitfinex 签名核心：必须是紧凑的 JSON (没有空格)
-        body = json.dumps(payload_dict, separators=(',', ':')) if payload_dict else "{}"
+        # 核心：必须确保签名用的字符串和发送的字符串完全一致
+        # 处理空 Body 的情况，Bitfinex 要求空 Body 时签名使用原文
+        if payload_dict:
+            # 使用 separators 确保没有额外空格
+            body = json.dumps(payload_dict, separators=(',', ':'))
+        else:
+            body = "{}"
         
         signature_payload = f"/api/v2{endpoint}{nonce}{body}"
         sig = hmac.new(self.api_secret.encode('utf8'), signature_payload.encode('utf8'), hashlib.sha384).hexdigest()
@@ -49,23 +54,17 @@ class BitfinexAPI:
         
         async with aiohttp.ClientSession() as session:
             try:
-                # 每个订单前微调延迟，防止 Nonce 碰撞
-                await asyncio.sleep(0.05)
+                # 强制间隔，防止 Nonce 碰撞
+                await asyncio.sleep(0.12)
                 async with session.post(url, headers=headers, data=body) as resp:
                     text = await resp.text()
                     try:
                         data = json.loads(text)
                     except:
-                        data = text
-                        
-                    if resp.status != 200:
-                        if self.logger:
-                            self.logger.error(f"Bitfinex 拒绝请求 ({resp.status}): {text}")
+                        data = {"error": "JSON_PARSE_FAILED", "text": text}
                     return data
             except Exception as e:
-                if self.logger:
-                    self.logger.error(f"网络请求异常: {e}")
-                return None
+                return {"error": "REQUEST_EXCEPTION", "msg": str(e)}
 
     async def get_ticker(self, symbol: str) -> float:
         url = f"{self.base_url}/ticker/{symbol}"
@@ -90,45 +89,44 @@ class BitfinexAPI:
         return 0.0
 
     async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
-        amount_str = "{:.6f}".format(float(amount))
+        # 极其严格的价格与数量格式化
+        amount_str = "{:.5f}".format(float(amount))
+        
         req = {
             "type": order_type.upper(),
             "symbol": symbol,
             "amount": amount_str,
         }
         if price:
-            # 价格必须是字符串，且符合精度
+            # 价格保留 1 位小数，这在 ETH 永续中是强制的
             req["price"] = "{:.1f}".format(float(price))
         if lev is not None:
             req["lev"] = int(lev)
         
-        flags = 0
         if reduce_only:
-            flags |= 1024
-        if flags > 0:
-            req["flags"] = flags
+            req["flags"] = 1024
 
         resp = await self.request("/auth/w/order/submit", req)
         
-        # 严谨判断是否成功：返回必须是列表且第一个元素不是 "error"
         is_success = False
-        error_msg = "未知错误"
+        error_msg = ""
         
+        # 解析 Bitfinex 复杂的嵌套返回
         if isinstance(resp, list):
             if len(resp) > 0 and resp[0] != "error":
                 is_success = True
             else:
-                error_msg = resp[2] if len(resp) >= 3 else str(resp)
+                error_msg = str(resp[2]) if len(resp) >= 3 else str(resp)
         else:
-            error_msg = str(resp)
+            error_msg = resp.get("error", str(resp)) if isinstance(resp, dict) else str(resp)
         
         if self.logger:
-            side_str = "买" if float(amount) > 0 else "卖"
-            p_display = "{:.1f}".format(price) if price else "市价"
+            side_str = "买入" if float(amount) > 0 else "卖出"
+            p_str = "{:.1f}".format(price) if price else "市价"
             if is_success:
-                self.logger.info(f"🟢 [下单成功] {side_str} {abs(float(amount)):.4f} @ {p_display}")
+                self.logger.info(f"✅ [下单成功] {side_str} {abs(float(amount)):.4f} @ {p_str}")
             else:
-                self.logger.error(f"🔴 [下单失败] {side_str} @ {p_display} | 原因: {error_msg}")
+                self.logger.error(f"❌ [下单失败] {side_str} @ {p_str} | 原因: {error_msg}")
         return resp
 
     async def fetch_open_orders(self, symbol: str) -> list:
