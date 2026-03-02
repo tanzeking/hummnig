@@ -259,24 +259,30 @@ class 一天量化2026_3_2(ScriptStrategyBase):
         self.grid_center_price = center_price
         spacing = self.grid_spacing_pct / 100
         current_equity = self.initial_capital + self.accumulated_profit
+        
+        # 严格计算：每层名义价值 = (总权益 * 杠杆) / 层数
+        # 10U * 10倍杠杆 = 100U 总额。10层网格，则每层 10U。
         level_notional = (current_equity * self.leverage) / self.grid_levels
         
-        self.logger().info(f"📏 超密撒网: 本金={current_equity:.2f}u, 间距={self.grid_spacing_pct}%, 止盈={self.take_profit_pct}%")
+        self.logger().info(f"📏 超密撒网: 总本金={current_equity:.2f}u, 杠杆={self.leverage}x, 每层名义价值={level_notional:.2f}u")
         
         for level in range(1, self.grid_levels + 1):
-            buy_p = center_price * (1 - level * spacing)
-            if buy_p >= self.lower_bound:
-                amt = round(level_notional / buy_p, 4)
-                # create_order 内部会处理格式化，这里直接传入计算值
-                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt, buy_p, lev=self.leverage)
-                self._track_order(res, buy_p, "buy", amt, is_tp=False)
+            # 买单
+            bp = float(center_price * (1 - level * spacing))
+            if bp >= self.lower_bound:
+                amt = float(level_notional / bp)
+                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", amt, bp, lev=self.leverage)
+                self._track_order(res, bp, "buy", amt, is_tp=False)
             
-            sell_p = center_price * (1 + level * spacing)
-            if sell_p <= self.upper_bound:
-                amt = round(level_notional / sell_p, 4)
-                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -amt, sell_p, lev=self.leverage)
-                self._track_order(res, sell_p, "sell", amt, is_tp=False)
-            await asyncio.sleep(0.2)
+            # 卖单
+            sp = float(center_price * (1 + level * spacing))
+            if sp <= self.upper_bound:
+                amt = float(level_notional / sp)
+                res = await self.bitfinex.create_order(self.bfx_symbol, "LIMIT", -amt, sp, lev=self.leverage)
+                self._track_order(res, sp, "sell", amt, is_tp=False)
+            
+            # 每下单一对，稍微喘息一下，Bitfinex 喜欢有秩序的请求
+            await asyncio.sleep(0.3)
 
     def _track_order(self, api_response, price, side, amount, is_tp):
         if not api_response: return
