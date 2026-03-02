@@ -11,15 +11,18 @@ from decimal import Decimal
 
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
-# 尝试从 .env 加载环境变量 (适配服务器环境)
-env_paths = ["/home/hummingbot/.env", ".env"]
+# 改进的 .env 加载逻辑，支持行尾注释和多余空格
+env_paths = [".env", "/home/hummingbot/.env"]
 for env_path in env_paths:
     if os.path.exists(env_path):
         with open(env_path, "r", encoding="utf8") as f:
             for line in f:
-                if line.strip() and not line.startswith("#") and "=" in line:
+                line = line.split("#", 1)[0].strip() # 剔除行尾注释
+                if "=" in line:
                     k, v = line.split("=", 1)
-                    os.environ[k.strip()] = v.strip().strip("'\"")
+                    val = v.strip().strip("'\"")
+                    os.environ[k.strip()] = val
+                    # 也可以尝试直接覆盖到 hummingbot 的配置中（如果需要）
 
 class BitfinexAPI:
     """极轻量 Bitfinex Async REST 客户端"""
@@ -32,18 +35,25 @@ class BitfinexAPI:
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
         
-        # 强制延迟，确保 Nonce 严格递增且不撞车
-        await asyncio.sleep(0.1)
-        nonce = str(int(time.time() * 1000)) # 官方最推荐的 13 位毫秒 Nonce
+        # 严格间隔，并使用 13 位毫秒 Nonce (最稳健)
+        await asyncio.sleep(0.2)
+        nonce = str(int(time.time() * 1000))
         
-        # 使用紧凑型 JSON (separators 重要)，且保持传入字典的 key 顺序
+        # 强制紧凑型 JSON，且 100% 确保字段顺序
         if payload_dict:
             body = json.dumps(payload_dict, separators=(',', ':'))
         else:
             body = "{}"
         
+        # 签名串必须按照 /api/v2 + endpoint + nonce + body 拼接
         signature_payload = f"/api/v2{endpoint}{nonce}{body}"
-        sig = hmac.new(self.api_secret.encode('utf8'), signature_payload.encode('utf8'), hashlib.sha384).hexdigest()
+        
+        # 生成签名
+        sig = hmac.new(
+            self.api_secret.encode('utf-8'),
+            signature_payload.encode('utf-8'),
+            hashlib.sha384
+        ).hexdigest()
         
         headers = {
             "bfx-nonce": nonce,
@@ -54,14 +64,13 @@ class BitfinexAPI:
         
         async with aiohttp.ClientSession() as session:
             try:
-                # 再次物理间隔保护
-                await asyncio.sleep(0.05)
                 async with session.post(url, headers=headers, data=body) as resp:
                     text = await resp.text()
                     try:
                         data = json.loads(text)
+                        # 检测 Bitfinex 报错列表格式 ["error", code, msg]
                         if isinstance(data, list) and len(data) >= 3 and data[0] == "error":
-                            return {"error": True, "msg": f"{data[1]}: {data[2]}"}
+                             return {"error": True, "code": data[1], "msg": data[2]}
                         return data
                     except:
                         return {"error": True, "msg": text}
@@ -92,22 +101,30 @@ class BitfinexAPI:
 
     async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
         try:
-            # 1. 严格字段排序 (OrderedDict)
+            # 强制将输入转换为 float，然后强制使用点作为分隔符
+            amt_val = float(amount)
+            price_val = float(price) if price else 0.0
+            
+            # 手动执行 1 位小数格式化，确保不受 locale 影响
+            # 如果 price_val 是 1965.6，这里强制生成 "1965.6" 字符串
+            price_str = "{:.1f}".format(price_val)
+            amount_str = "{:.5f}".format(amt_val)
+
+            # 严格有序字典，对齐 Bitfinex V2 要求
             req = OrderedDict()
             req["type"] = order_type.upper()
             req["symbol"] = symbol
-            req["amount"] = "{:.5f}".format(float(amount)) # 数量必须是字符串
-            
-            if price and float(price) > 0:
-                price_val = float(price)
-                if price_val > 8000: # ETH 熔断保护
-                    return {"error": True, "msg": "PRICE_ABNORMAL"}
-                req["price"] = "{:.1f}".format(price_val) # 价格必须是字符串且1位小数
+            req["amount"] = amount_str
+            if price_val > 0:
+                # 价格熔断保护
+                if price_val > 8000:
+                    return {"error": True, "msg": f"PRICE_TOO_HIGH_{price_val}"}
+                req["price"] = price_str
             
             if lev:
-                req["lev"] = int(lev) # 杠杆必须是整数 (JSON Number)
+                req["lev"] = int(lev)
             if reduce_only:
-                req["flags"] = 1024 # 标志必须是整数 (JSON Number)
+                req["flags"] = 1024
 
             resp = await self.request("/auth/w/order/submit", req)
             
@@ -117,19 +134,18 @@ class BitfinexAPI:
             if isinstance(resp, list) and len(resp) > 0 and resp[0] != "error":
                 is_success = True
             else:
-                # 详细捕获错误原因
                 msg = resp.get("msg", str(resp)) if isinstance(resp, dict) else str(resp)
 
             if self.logger:
-                side = "🟢 买入" if float(amount) > 0 else "🔴 卖出"
+                side = "🟢 买入" if amt_val > 0 else "🔴 卖出"
                 p_disp = req.get("price", "市价")
                 if is_success:
-                    self.logger.info(f"{side} 已申报 | 价格: {p_disp} | 数量: {req['amount']}")
+                    self.logger.info(f"{side} 已申报 | 价格: {p_disp} | 数量: {amount_str}")
                 else:
                     self.logger.error(f"❌ 下单失败 | 价格: {p_disp} | 原因: {msg}")
             return resp
         except Exception as e:
-            if self.logger: self.logger.error(f"下单模块异常: {e}")
+            if self.logger: self.logger.error(f"下单异常: {e}")
             return {"error": True, "msg": str(e)}
 
     async def fetch_open_orders(self, symbol: str) -> list:
@@ -196,8 +212,16 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     
     def __init__(self, connectors: Dict[str, Any]):
         super().__init__(connectors)
-        api_key = os.getenv("BITFINEX_API_KEY", "")
-        api_secret = os.getenv("BITFINEX_API_SECRET", "")
+        api_key = os.getenv("BITFINEX_API_KEY", "").strip()
+        api_secret = os.getenv("BITFINEX_API_SECRET", "").strip()
+        
+        if api_key and api_secret:
+            masked_key = f"{api_key[:6]}...{api_key[-4:]}"
+            masked_secret = f"{api_secret[:4]}...{api_secret[-4:]}"
+            self.logger().info(f"🔑 API Key 加载成功: {masked_key} | Secret: {masked_secret}")
+        else:
+            self.logger().error("🚨 错误: 未能在 .env 中找到 API 凭证！")
+
         self.bitfinex = BitfinexAPI(api_key, api_secret, logger=self.logger())
         self.tracked_orders = {}
         self.accumulated_profit = 0.0
