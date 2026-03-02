@@ -79,6 +79,7 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     grid_levels = 4         
     grid_spacing = 0.001    
     tp_pct = 0.002          
+    sl_roi = 0.50           # ✨ 止损调整为 50% ROI
     
     anchor_price = 0.0      
     max_pos_amount = 0.16   
