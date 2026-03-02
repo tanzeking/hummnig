@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 # ==========================================
-# === 🛡️ Bitfinex 智能阵地加固版 API ===
+# === 🛡️ Bitfinex 智能保证金防御版 API ===
 # ==========================================
 class BitfinexAPI:
     def __init__(self, api_key: str, api_secret: str, logger):
@@ -30,18 +30,21 @@ class BitfinexAPI:
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.post(url, headers=headers, data=body, timeout=5) as resp:
-                    return await resp.json()
+                    res_json = await resp.json()
+                    # 💡 捕获“保证金不足”报错，防止刷屏
+                    if isinstance(res_json, list) and len(res_json) > 1 and res_json[0] == "error":
+                        if "margin" in str(res_json[2]).lower():
+                            return {"margin_error": True, "raw": res_json}
+                    return res_json
             except: return None
 
     async def get_derivatives_balance(self) -> float:
-        # 💡 针对合约账户的可用保证金精准核对
         resp = await self.request("/auth/r/wallets")
         if resp and isinstance(resp, list):
             for w in resp:
-                # 寻找合约钱包 (derivatives) 的可用余额 (第5位)
                 if w[0] == "derivatives" and (w[1] == "USTF0" or w[1] == "USD"):
                     return float(w[4])
-        return 10.0
+        return 1.0
 
     async def get_positions(self):
         return await self.request("/auth/r/positions") or []
@@ -51,7 +54,6 @@ class BitfinexAPI:
         return [o for o in resp if isinstance(o, list) and len(o) > 3 and o[3] == symbol] if isinstance(resp, list) else []
 
     async def create_order(self, symbol, amount, price=None, lev=30, type="LIMIT", flags=0):
-        # 💡 CID 绑定：侧重防止同价位多开
         side = 1 if float(amount) > 0 else 2
         cid = int(float(price) * 100) + (side * 1000000) if price else int(time.time() % 1000000)
         req = {"type": type.upper(), "symbol": symbol, "amount": "{:.5f}".format(float(amount)), "lev": int(lev), "cid": cid, "flags": flags}
@@ -66,7 +68,7 @@ class BitfinexAPI:
         return await self.request("/auth/w/order/cancel/multi", {"all": 1})
 
 # ==========================================
-# === 🚀 阵地保卫版 3.0 (全速对齐) ===
+# === 🚀 阵地保卫版 5.0 (保证金熔断版) ===
 # ==========================================
 class 一天量化2026_3_2(ScriptStrategyBase):
     markets = {"okx": {"ETH-USDT"}} 
@@ -75,14 +77,18 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     leverage_long = 30
     leverage_short = 15
     grid_levels = 4         
-    grid_spacing = 0.001    # 0.1% = 2刀
-    tp_pct = 0.002          # 0.2% 
+    grid_spacing = 0.001    
+    tp_pct = 0.002          
     
     anchor_price = 0.0      
     max_pos_amount = 0.16   
     check_interval = 8      
     last_check_time = 0
     is_executing = False
+    
+    # 💥 安全防御参数
+    safety_buffer_usd = 5.0    # 强制预留 5U 不动，专门对付手续费和插针
+    margin_utilization = 0.35  # 单边占用降至 35%
 
     def __init__(self, connectors: Dict[str, Any]):
         super().__init__(connectors)
@@ -102,7 +108,6 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     async def maintain_strategy(self):
         self.is_executing = True
         try:
-            # 1. 获取最新行情
             ticker_url = f"https://api.bitfinex.com/v2/ticker/{self.bfx_symbol}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(ticker_url) as resp:
@@ -110,7 +115,9 @@ class 一天量化2026_3_2(ScriptStrategyBase):
                     mid_p = float(data[6]) if isinstance(data, list) and len(data) >= 7 else 0.0
             if mid_p <= 0: return
 
-            balance = await self.bfx.get_derivatives_balance()
+            raw_balance = await self.bfx.get_derivatives_balance()
+            active_balance = max(0.0, raw_balance - self.safety_buffer_usd) # 扣除 5U 强制预留
+            
             positions = await self.bfx.get_positions()
             all_orders = await self.bfx.get_open_orders(self.bfx_symbol)
 
@@ -121,51 +128,49 @@ class 一天量化2026_3_2(ScriptStrategyBase):
                     curr_pos = float(pos[2])
                     entry_p = float(pos[3])
 
-            # 2. 🛡️ 智能止盈单维护
+            # 🛠️ 1. 平仓优先级最高 (不需要检查保证金)
             if abs(curr_pos) > 0.0001:
                 tp_p = round(entry_p * (1 + self.tp_pct if curr_pos > 0 else 1 - self.tp_pct), 2)
-                # 寻找现有的止盈单
                 tp_order = next((o for o in all_orders if abs(float(o[16]) - tp_p) < 0.2), None)
                 if not tp_order or abs(float(tp_order[6]) + curr_pos) > 0.001:
                     if tp_order: await self.bfx.cancel_orders([tp_order[0]])
-                    self.logger().info(f"🎯 正在同步止盈单: 价格 {tp_p}, 数量 {-curr_pos}")
                     await self.bfx.create_order(self.bfx_symbol, -curr_pos, tp_p, lev=30)
             
-            # 3. 🎯 阵地整体重整 (核心改动)
-            # 价格跑出 0.3% 时，发起强制大扫除
+            # 🛡️ 熔断：如果可用资金已经极低，不再进行任何加仓/补网动作
+            if active_balance < 1.0:
+                self.logger().warning(f"⚠️ 余额告急({raw_balance}U)，已触发安全熔断，暂停补单！")
+                self.is_executing = False
+                return
+
+            # 2. 阵地管理
             if self.anchor_price <= 0 or abs(mid_p - self.anchor_price) > (self.anchor_price * 0.003):
-                self.logger().info(f"✨ 阵地发生显著偏移，正在执行全网格重洗...")
-                
-                # 撤销除止盈单以外的所有网格
-                ids_to_cancel = []
-                for o in all_orders:
-                    # 如果不是止盈单 (止盈单通常是全仓量)
-                    if abs(float(o[6]) + curr_pos) > 0.001 or abs(curr_pos) < 0.001:
-                        ids_to_cancel.append(o[0])
-                
-                if ids_to_cancel:
-                    await self.bfx.cancel_orders(ids_to_cancel)
-                    await asyncio.sleep(1) # 给 API 反应时间
-                
+                self.logger().info(f"📍 阵地迁移 | 预留可用金:{self.safety_buffer_usd}U")
+                ids_to_cancel = [o[0] for o in all_orders if abs(float(o[6]) + curr_pos) > 0.001 or abs(curr_pos) < 0.001]
+                if ids_to_cancel: await self.bfx.cancel_orders(ids_to_cancel)
+                await asyncio.sleep(1)
                 self.anchor_price = mid_p
-                # 更新本地订单缓存
                 all_orders = [o for o in all_orders if o[0] not in ids_to_cancel]
 
-            # 4. 补齐网格坑位
+            # 3. 带防御的精准补单
+            failed_due_to_margin = False
             for i in range(1, self.grid_levels + 1):
-                # 4.1 买单坑
+                if failed_due_to_margin: break # 上一单要是报错没钱了，后面就不试了
+                
+                # 买单
                 p_buy = round(self.anchor_price * (1 - i * self.grid_spacing), 2)
                 if curr_pos < self.max_pos_amount and not any(abs(float(o[16]) - p_buy) < 0.2 for o in all_orders):
-                    amt = max(0.005, round((balance * 0.45 * self.leverage_long) / (self.grid_levels * p_buy), 4))
-                    await self.bfx.create_order(self.bfx_symbol, amt, p_buy, lev=self.leverage_long, flags=4096)
+                    amt = max(0.005, round((active_balance * self.margin_utilization * self.leverage_long) / (self.grid_levels * p_buy), 4))
+                    res = await self.bfx.create_order(self.bfx_symbol, amt, p_buy, lev=self.leverage_long, flags=4096)
+                    if isinstance(res, dict) and res.get("margin_error"): failed_due_to_margin = True
                 
-                # 4.2 卖单坑 (即使多头持仓也要挂，充当减仓位)
+                # 卖单
                 p_sell = round(self.anchor_price * (1 + i * self.grid_spacing), 2)
                 if curr_pos > -self.max_pos_amount and not any(abs(float(o[16]) - p_sell) < 0.2 for o in all_orders):
-                    amt = -max(0.005, round((balance * 0.45 * self.leverage_short) / (self.grid_levels * p_sell), 4))
-                    await self.bfx.create_order(self.bfx_symbol, amt, p_sell, lev=self.leverage_short, flags=4096)
+                    amt = -max(0.005, round((active_balance * self.margin_utilization * self.leverage_short) / (self.grid_levels * p_sell), 4))
+                    res = await self.bfx.create_order(self.bfx_symbol, amt, p_sell, lev=self.leverage_short, flags=4096)
+                    if isinstance(res, dict) and res.get("margin_error"): failed_due_to_margin = True
 
-            self.logger().info(f"✅ 阵地对齐中 | 现价:{mid_p} | 挂单数:{len(all_orders)}")
+            self.logger().info(f"✅ 阵地对齐 | 余额:{raw_balance:.2f}U | 持仓:{curr_pos:.4f}")
 
         except Exception as e:
             self.logger().error(f"❌ 系统异常: {str(e)}")
@@ -173,4 +178,4 @@ class 一天量化2026_3_2(ScriptStrategyBase):
             self.is_executing = False
 
     def format_status(self) -> str:
-        return f"阵地保卫战 3.0 | 全网格自动大扫除 | 间距:0.1%"
+        return f"阵地保卫战 5.0 | 5U强制熔断保护 | 间距:0.1%"
