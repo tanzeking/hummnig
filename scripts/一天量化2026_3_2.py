@@ -35,25 +35,17 @@ class BitfinexAPI:
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
         
-        # 严格间隔，并使用 13 位毫秒 Nonce (最稳健)
-        await asyncio.sleep(0.2)
-        nonce = str(int(time.time() * 1000))
+        # 强制微秒级 Nonce (16位)，彻底解决 nonce small 问题
+        await asyncio.sleep(0.1)
+        nonce = str(int(time.time() * 1000000))
         
-        # 强制紧凑型 JSON，且 100% 确保字段顺序
         if payload_dict:
             body = json.dumps(payload_dict, separators=(',', ':'))
         else:
             body = "{}"
         
-        # 签名串必须按照 /api/v2 + endpoint + nonce + body 拼接
         signature_payload = f"/api/v2{endpoint}{nonce}{body}"
-        
-        # 生成签名
-        sig = hmac.new(
-            self.api_secret.encode('utf-8'),
-            signature_payload.encode('utf-8'),
-            hashlib.sha384
-        ).hexdigest()
+        sig = hmac.new(self.api_secret.encode('utf-8'), signature_payload.encode('utf-8'), hashlib.sha384).hexdigest()
         
         headers = {
             "bfx-nonce": nonce,
@@ -68,7 +60,6 @@ class BitfinexAPI:
                     text = await resp.text()
                     try:
                         data = json.loads(text)
-                        # 检测 Bitfinex 报错列表格式 ["error", code, msg]
                         if isinstance(data, list) and len(data) >= 3 and data[0] == "error":
                              return {"error": True, "code": data[1], "msg": data[2]}
                         return data
