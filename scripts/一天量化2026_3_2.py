@@ -30,29 +30,41 @@ class BitfinexAPI:
 
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
-        # 增加微秒级的延迟，确保并发请求时的 Nonce 强制唯一
-        await asyncio.sleep(0.01)
-        nonce = str(int(time.time() * 1000000))
-        body = json.dumps(payload_dict) if payload_dict else "{}"
+        
+        # 使用纳秒级时间戳作为 Nonce，确保高频下单时绝对唯一且递增
+        nonce = str(time.time_ns() // 1000)
+        
+        # Bitfinex 签名核心：必须是紧凑的 JSON (没有空格)
+        body = json.dumps(payload_dict, separators=(',', ':')) if payload_dict else "{}"
+        
         signature_payload = f"/api/v2{endpoint}{nonce}{body}"
         sig = hmac.new(self.api_secret.encode('utf8'), signature_payload.encode('utf8'), hashlib.sha384).hexdigest()
+        
         headers = {
             "bfx-nonce": nonce,
             "bfx-apikey": self.api_key,
             "bfx-signature": sig,
             "content-type": "application/json"
         }
+        
         async with aiohttp.ClientSession() as session:
             try:
+                # 每个订单前微调延迟，防止 Nonce 碰撞
+                await asyncio.sleep(0.05)
                 async with session.post(url, headers=headers, data=body) as resp:
                     text = await resp.text()
+                    try:
+                        data = json.loads(text)
+                    except:
+                        data = text
+                        
                     if resp.status != 200:
                         if self.logger:
-                            self.logger.error(f"Bitfinex API Error: {resp.status} - {text}")
-                    return json.loads(text)
+                            self.logger.error(f"Bitfinex 拒绝请求 ({resp.status}): {text}")
+                    return data
             except Exception as e:
                 if self.logger:
-                    self.logger.error(f"Request failed: {e}")
+                    self.logger.error(f"网络请求异常: {e}")
                 return None
 
     async def get_ticker(self, symbol: str) -> float:
@@ -85,6 +97,7 @@ class BitfinexAPI:
             "amount": amount_str,
         }
         if price:
+            # 价格必须是字符串，且符合精度
             req["price"] = "{:.1f}".format(float(price))
         if lev is not None:
             req["lev"] = int(lev)
@@ -97,16 +110,25 @@ class BitfinexAPI:
 
         resp = await self.request("/auth/w/order/submit", req)
         
-        # 安全解析响应，防止 object of type 'int' has no len()
-        error_msg = None
-        if isinstance(resp, list) and len(resp) >= 8:
-            if resp[6] == "ERROR":
-                error_msg = resp[7]
+        # 严谨判断是否成功：返回必须是列表且第一个元素不是 "error"
+        is_success = False
+        error_msg = "未知错误"
+        
+        if isinstance(resp, list):
+            if len(resp) > 0 and resp[0] != "error":
+                is_success = True
+            else:
+                error_msg = resp[2] if len(resp) >= 3 else str(resp)
+        else:
+            error_msg = str(resp)
         
         if self.logger:
             side_str = "买" if float(amount) > 0 else "卖"
-            status_str = f"❌ 失败: {error_msg}" if error_msg else "✅ 成功"
-            self.logger.info(f"[{symbol}下单] {order_type} {side_str} {abs(float(amount)):.6f} @ {price} | {status_str}")
+            p_display = "{:.1f}".format(price) if price else "市价"
+            if is_success:
+                self.logger.info(f"🟢 [下单成功] {side_str} {abs(float(amount)):.4f} @ {p_display}")
+            else:
+                self.logger.error(f"🔴 [下单失败] {side_str} @ {p_display} | 原因: {error_msg}")
         return resp
 
     async def fetch_open_orders(self, symbol: str) -> list:
