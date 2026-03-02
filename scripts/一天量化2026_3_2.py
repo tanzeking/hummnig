@@ -56,18 +56,19 @@ class BitfinexAPI:
         return await self.request("/auth/w/order/cancel/multi", {"all": 1})
 
 # ==========================================
-# === 🚀 超高频动态止盈网格 (修正逻辑版) ===
+# === 🚀 动态加固网格 (0.1% 间距 / 0.2% 止盈) ===
 # ==========================================
 class 一天量化2026_3_2(ScriptStrategyBase):
     markets = {"okx": {"ETH-USDT"}} 
     bfx_symbol = "tETHF0:USTF0"
     
+    # --- 调整后的核心参数 ---
     leverage_long = 30
     leverage_short = 15
-    grid_levels = 4         # 每边 4 层
-    grid_spacing = 0.0005   # 0.05%
-    tp_pct = 0.001          # 0.1% 止盈
-    max_pos_amount = 0.14   # 硬顶限制
+    grid_levels = 4         
+    grid_spacing = 0.001    # 💥 修改为 0.1% 开单间距
+    tp_pct = 0.002          # 💥 修改为 0.2% 止盈
+    max_pos_amount = 0.12   # 防止单边过重
     
     last_check_time = 0
     check_interval = 5      
@@ -92,6 +93,7 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     async def maintain_strategy(self):
         self.is_executing = True
         try:
+            # 1. 获取行情
             ticker_url = f"https://api.bitfinex.com/v2/ticker/{self.bfx_symbol}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(ticker_url) as resp:
@@ -110,35 +112,33 @@ class 一天量化2026_3_2(ScriptStrategyBase):
                     current_pos = float(pos[2])
                     entry_price = float(pos[3])
 
-            # 1. 精准止盈判断
+            # 2. 精准止盈监控 (排除网格干扰)
             if abs(current_pos) > 0.0001:
                 side = "long" if current_pos > 0 else "short"
+                # 计算止盈位
                 tp_target = round(entry_price * (1 + self.tp_pct if side == "long" else 1 - self.tp_pct), 2)
+                # 检查是否已挂止盈单 (价格±0.15以内都算)
+                has_tp = any(abs(float(o[16]) - tp_target) < 0.15 for o in open_orders)
                 
-                # 只有当[价格刚好等于预期止盈价]的单子存在，才认为有止盈单
-                has_tp_order = any(abs(float(o[16]) - tp_target) < 0.1 for o in open_orders)
-                
-                if not has_tp_order:
-                    self.logger().info(f"🚨 修正：补挂 0.1% 止盈单 @ {tp_target}")
-                    await self.bfx.create_order(self.bfx_symbol, -current_pos, tp_target, lev=30, type="LIMIT")
+                if not has_tp:
+                    self.logger().info(f"🚨 挂出自动止盈单: {side} @ {tp_target}")
+                    await self.bfx.create_order(self.bfx_symbol, -current_pos, tp_target, lev=30)
 
-            # 2. 补网格逻辑（排除掉止盈单后的数量）
-            # 过滤掉那些价格极靠近止盈位的单子，剩下的才是网格单
-            grid_orders = [o for o in open_orders if abs(float(o[16]) - mid_price) < (mid_price * 0.01)]
+            # 3. 补网格逻辑
+            grid_orders = [o for o in open_orders if abs(float(o[16]) - mid_price) < (mid_price * 0.02)]
             l_grids = [o for o in grid_orders if float(o[6]) > 0]
             s_grids = [o for o in grid_orders if float(o[6]) < 0]
 
-            # 只有在持仓安全范围内才补开仓网格
             if current_pos < self.max_pos_amount and len(l_grids) < self.grid_levels:
-                await self.deploy_grid_layer("long", mid_price, balance, len(l_grids))
+                await self.deploy_layer("long", mid_price, balance, len(l_grids))
             
             if current_pos > -self.max_pos_amount and len(s_grids) < self.grid_levels:
-                await self.deploy_grid_layer("short", mid_price, balance, len(s_grids))
+                await self.deploy_layer("short", mid_price, balance, len(s_grids))
 
         finally:
             self.is_executing = False
 
-    async def deploy_grid_layer(self, side, mid_price, balance, current_count):
+    async def deploy_layer(self, side, mid_price, balance, current_count):
         idx = current_count + 1
         use_bal = balance if balance > 2.0 else 10.0
         if side == "long":
@@ -151,4 +151,4 @@ class 一天量化2026_3_2(ScriptStrategyBase):
             await self.bfx.create_order(self.bfx_symbol, a, p, lev=self.leverage_short, flags=4096)
 
     def format_status(self) -> str:
-        return f"修复止盈逻辑版 | 间距:0.05% | 止盈:0.1% | 正在盯盘..."
+        return f"稳定动态网格 | 间距:0.1% | 止盈:0.2% | 持仓上限:0.12 ETH"
