@@ -62,13 +62,14 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     markets = {"okx": {"ETH-USDT"}} 
     bfx_symbol = "tETHF0:USTF0"
     
-    # --- 调整后的核心参数 ---
     leverage_long = 30
     leverage_short = 15
     grid_levels = 4         
-    grid_spacing = 0.001    # 💥 修改为 0.1% 开单间距
-    tp_pct = 0.002          # 💥 修改为 0.2% 止盈
-    max_pos_amount = 0.12   # 防止单边过重
+    grid_spacing = 0.001    # 0.1% 间距
+    tp_pct = 0.002          # 0.2% 止盈
+    
+    # 💥 修改上限为 0.16 (约 310U 市值)，确保低于 300U 时会一直下单
+    max_pos_amount = 0.16   
     
     last_check_time = 0
     check_interval = 5      
@@ -93,7 +94,6 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     async def maintain_strategy(self):
         self.is_executing = True
         try:
-            # 1. 获取行情
             ticker_url = f"https://api.bitfinex.com/v2/ticker/{self.bfx_symbol}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(ticker_url) as resp:
@@ -112,27 +112,26 @@ class 一天量化2026_3_2(ScriptStrategyBase):
                     current_pos = float(pos[2])
                     entry_price = float(pos[3])
 
-            # 2. 精准止盈监控 (排除网格干扰)
+            # 1. 自动止盈
             if abs(current_pos) > 0.0001:
                 side = "long" if current_pos > 0 else "short"
-                # 计算止盈位
                 tp_target = round(entry_price * (1 + self.tp_pct if side == "long" else 1 - self.tp_pct), 2)
-                # 检查是否已挂止盈单 (价格±0.15以内都算)
                 has_tp = any(abs(float(o[16]) - tp_target) < 0.15 for o in open_orders)
-                
                 if not has_tp:
-                    self.logger().info(f"🚨 挂出自动止盈单: {side} @ {tp_target}")
+                    self.logger().info(f"🎯 补挂止盈单: {tp_target}")
                     await self.bfx.create_order(self.bfx_symbol, -current_pos, tp_target, lev=30)
 
-            # 3. 补网格逻辑
+            # 2. 补网格 (只要持仓 < 0.16 且 挂单不足时就下单)
             grid_orders = [o for o in open_orders if abs(float(o[16]) - mid_price) < (mid_price * 0.02)]
             l_grids = [o for o in grid_orders if float(o[6]) > 0]
             s_grids = [o for o in grid_orders if float(o[6]) < 0]
 
             if current_pos < self.max_pos_amount and len(l_grids) < self.grid_levels:
+                self.logger().info(f"♻️ 持仓 {current_pos:.4f} < {self.max_pos_amount}, 正在补买单...")
                 await self.deploy_layer("long", mid_price, balance, len(l_grids))
             
             if current_pos > -self.max_pos_amount and len(s_grids) < self.grid_levels:
+                self.logger().info(f"♻️ 持仓 {current_pos:.4f} > -{self.max_pos_amount}, 正在补卖单...")
                 await self.deploy_layer("short", mid_price, balance, len(s_grids))
 
         finally:
@@ -151,4 +150,4 @@ class 一天量化2026_3_2(ScriptStrategyBase):
             await self.bfx.create_order(self.bfx_symbol, a, p, lev=self.leverage_short, flags=4096)
 
     def format_status(self) -> str:
-        return f"稳定动态网格 | 间距:0.1% | 止盈:0.2% | 持仓上限:0.12 ETH"
+        return f"动态补货网格 | 持仓上限:0.16 ETH (~310U)"
