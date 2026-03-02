@@ -31,14 +31,13 @@ class BitfinexAPI:
     async def request(self, endpoint: str, payload_dict: dict = None):
         url = self.base_url + endpoint
         
-        # 使用纳秒级时间戳，确保即便毫秒内并发，Nonce也严格递增
-        nonce = str(time.time_ns())
+        # 强制微小延迟，防止高频下 Nonce 冲突
+        await asyncio.sleep(0.1)
+        # 使用 13 位毫秒 Nonce，这是 Bitfinex 最兼容的格式
+        nonce = str(int(time.time() * 1000))
         
-        # 核心：必须使用无空格的紧凑JSON，否则签名校验(Digest)必失败
-        if payload_dict:
-            body = json.dumps(payload_dict, separators=(',', ':'))
-        else:
-            body = "{}"
+        # 核心：必须使用紧凑型 JSON 且不带空格
+        body = json.dumps(payload_dict, separators=(',', ':')) if payload_dict else "{}"
         
         signature_payload = f"/api/v2{endpoint}{nonce}{body}"
         sig = hmac.new(self.api_secret.encode('utf8'), signature_payload.encode('utf8'), hashlib.sha384).hexdigest()
@@ -52,16 +51,18 @@ class BitfinexAPI:
         
         async with aiohttp.ClientSession() as session:
             try:
-                # 增加极小的排队延迟，保护 Nonce 顺序
-                await asyncio.sleep(0.08)
                 async with session.post(url, headers=headers, data=body) as resp:
                     text = await resp.text()
                     try:
-                        return json.loads(text)
+                        data = json.loads(text)
+                        # 如果返回的是报错列表 ["error", 10100, "msg"]，格式化为标准字典方便处理
+                        if isinstance(data, list) and len(data) >= 3 and data[0] == "error":
+                            return {"error": True, "code": data[1], "msg": data[2]}
+                        return data
                     except:
-                        return text
+                        return {"error": True, "msg": text}
             except Exception as e:
-                return {"error": str(e)}
+                return {"error": True, "msg": str(e)}
 
     async def get_ticker(self, symbol: str) -> float:
         url = f"{self.base_url}/ticker/{symbol}"
@@ -86,20 +87,16 @@ class BitfinexAPI:
         return 0.0
 
     async def create_order(self, symbol: str, order_type: str, amount: float, price: float = None, lev: int = None, reduce_only: bool = False):
-        # 极其严格的数据转换：确保点位和精度不出错
-        amt_val = float(amount)
-        amt_str = "{:.5f}".format(amt_val)
+        amt_str = "{:.5f}".format(float(amount))
         
+        # 严格按照 Bitfinex 偏好的字段顺序排列
         req = {
             "type": order_type.upper(),
             "symbol": symbol,
-            "amount": amt_str,
+            "amount": amt_str
         }
         if price:
-            # 价格保留 1 位小数，严禁使用 round()，防止浮点数毛刺
-            price_val = float(price)
-            req["price"] = "{:.1f}".format(price_val)
-        
+            req["price"] = "{:.1f}".format(float(price))
         if lev is not None:
             req["lev"] = int(lev)
         if reduce_only:
@@ -107,31 +104,35 @@ class BitfinexAPI:
 
         resp = await self.request("/auth/w/order/submit", req)
         
-        # 严谨的错误侦测逻辑
         is_success = False
         error_info = "未知错误"
         
         if isinstance(resp, list):
+            # 只有当第一个元素不是 'error' 且是列表时才判定为成功
             if len(resp) > 0 and resp[0] != "error":
                 is_success = True
             elif len(resp) >= 3:
                 error_info = f"{resp[2]}"
         elif isinstance(resp, dict):
-            error_info = resp.get("message", resp.get("error", str(resp)))
+            if not resp.get("error"):
+                is_success = True
+            else:
+                error_info = resp.get("msg", resp.get("message", str(resp)))
         
         if self.logger:
-            side_str = "🟢 买入" if amt_val > 0 else "🔴 卖出"
+            side_str = "🟢 买入" if float(amount) > 0 else "🔴 卖出"
             p_display = "{:.1f}".format(float(price)) if price else "市价"
             if is_success:
-                self.logger.info(f"{side_str} 成功 | 价格: {p_display} | 数量: {abs(amt_val):.4f}")
+                self.logger.info(f"{side_str} 成功 | 价格: {p_display} | 数量: {abs(float(amount)):.4f}")
             else:
                 self.logger.error(f"❌ 下单失败 | 价格: {p_display} | 原因: {error_info}")
         return resp
 
     async def fetch_open_orders(self, symbol: str) -> list:
         resp = await self.request("/auth/r/orders")
-        if isinstance(resp, list):
-            return [o for o in resp if len(o) > 3 and o[3] == symbol]
+        # 必须先确保 resp 是列表，且不是报错列表
+        if isinstance(resp, list) and len(resp) > 0 and resp[0] != "error":
+            return [o for o in resp if isinstance(o, list) and len(o) > 3 and o[3] == symbol]
         return []
 
     async def cancel_order(self, order_id: int):
