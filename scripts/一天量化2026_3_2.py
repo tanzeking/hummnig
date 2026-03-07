@@ -57,12 +57,19 @@ class BitfinexAPI:
     async def get_derivatives_balance(self) -> float:
         resp = await self.request("/auth/r/wallets")
         if resp and isinstance(resp, list):
+            # 打印所有钱包，方便调试
+            deriv_wallets = [w for w in resp if isinstance(w, list) and len(w) >= 3 and w[0] == "derivatives"]
+            self.logger.info(f"🔍 Derivatives 钱包列表: {deriv_wallets}")
+            # FIX: 扩展匹配更多 Bitfinex 衍生品钱包货币名称
+            DERIV_CURRENCIES = ("USTF0", "USD", "UST", "USDT", "USDt", "USDT0", "CNHT")
             for w in resp:
-                if isinstance(w, list) and len(w) >= 5 and w[0] == "derivatives" and w[1] in ("USTF0", "USD"):
-                    # FIX [P1]: w[4] 可能为 None，加保护
-                    avail = w[4] if w[4] is not None else w[2]
-                    return float(avail) if avail is not None else 0.0
-        # FIX [P1]: 改为返回 0.0 而非 1.0，避免误判为有余额
+                if isinstance(w, list) and len(w) >= 3 and w[0] == "derivatives" and w[1] in DERIV_CURRENCIES:
+                    # w[4] = available balance; w[2] = total balance
+                    avail = w[4] if (len(w) > 4 and w[4] is not None) else w[2]
+                    val = float(avail) if avail is not None else 0.0
+                    self.logger.info(f"💰 余额读取: 钱包={w[0]} 币种={w[1]} 可用={val:.4f}U")
+                    return val
+        self.logger.warning("⚠️ 未找到 derivatives 钱包，返回 0.0")
         return 0.0
 
     async def get_mark_price(self, symbol: str) -> float:
@@ -142,8 +149,9 @@ class 一天量化2026_3_2(ScriptStrategyBase):
     relocate_threshold = 0.003
 
     # 💥 安全防御参数
-    # FIX [P1]: 从 5U → 15U，覆盖资金费率（每天 3 次）冲击
-    safety_buffer_usd = 15.0
+    # FIX: 降至 2U，适配小账户（原 15U 超过账户余额会导致永久熔断）
+    # 建议：账户余额的 20%~25%，例如 8U 账户设 2U
+    safety_buffer_usd = 2.0
     margin_utilization = 0.35
 
     def __init__(self, connectors: Dict[str, Any]):
